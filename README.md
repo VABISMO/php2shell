@@ -36,7 +36,7 @@ not match the profile.
 | PHP 8.5.11 amd64 | `php:8.5.11-apache` | `php-8.5.11-bookworm-amd64` | yes | yes | **yes** | separate offsets, same `htdata` |
 | PHP 8.5.10 aarch64 | `php:8.5.10-apache` | `php-8.5.10-bookworm-aarch64` | yes | yes | **yes** | `uid=33(www-data)` |
 | PHP 8.4.26 amd64 | `php:8.4.26-apache` | `php-8.4.26-bookworm-amd64` | yes | yes | **yes** | reference build |
-| PHP 8.4.26 FPM | `php:8.4.26-fpm` (nginx) | `8.4.26-fpm` | n/a | n/a | **yes** | `BG(unserialize)` chain; worker runs `uid=1000` proof |
+| PHP 8.4.26 FPM | php-8.4.26 source tarball (nginx+FPM) | `8.4.26-fpm` | n/a | n/a | **yes** | `BG(unserialize)` chain; two-slot reclaim, self-correcting retries |
 | PHP 8.4.25 aarch64 | `php:8.4.25-apache` | `php-8.4.25-bookworm-aarch64` | yes | yes | **yes** | probabilistic stage 3; retries |
 | PHP 8.5.0 aarch64 | `php:8.5.0-apache` | `php-8.5.0-bookworm` | yes | yes | no | stage-3 layout not found |
 | PHP 8.3.35 aarch64 | `php:8.3.35-apache` | `php-8.3.35-bookworm-aarch64` | yes | yes | no | stage-3 reference alive |
@@ -48,10 +48,10 @@ not match the profile.
 | PHP 7.4.33 aarch64 | `php:7.4-apache` | `php-7.4.33-bookworm-aarch64` | no | no | no | UAF; leak shape differs |
 | PHP 8.2.0 aarch64 | `php:8.2.0-apache` | — (offsets only) | n/a | n/a | no | no heap profile |
 
-**13 heap profiles, 5 with verified RCE. Offsets extracted for 12 builds.**
-Plus one FPM profile (`8.4.26-fpm`) with verified RCE through the
-`BG(unserialize)` stale-state chain (no heap-leak stages; the stale struct is
-located with the oracle each run).
+**14 profiles (13 heap + 1 FPM), 6 with verified RCE. Offsets extracted for
+12 builds.** The FPM profile has no heap-leak stages: the stale
+`BG(unserialize)` struct is located with the oracle each run
+([docs/fpm-chain.md](docs/fpm-chain.md)).
 
 `Heap leak` is stage 1, `libphp leak` is stage 2 and `RCE` is a real command
 proof on an isolated lab. `no` means not verified, not necessarily impossible;

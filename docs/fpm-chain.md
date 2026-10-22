@@ -132,7 +132,7 @@ proof separately:
 
 ```sh
 curl http://127.0.0.1:8110/out/p1
-# uid=1000(cryptocalypse) gid=1000(cryptocalypse) groups=...
+# uid=1000(...) gid=1000(...) groups=...
 ```
 
 On the reference run the proof was `uid=1000` (the unprivileged lab user),

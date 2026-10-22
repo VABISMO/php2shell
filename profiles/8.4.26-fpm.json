@@ -29,6 +29,6 @@
     "session_upload_progress": "On",
     "workers": 2
   },
-  "status": "RCE verified in the nginx+FPM lab: post-RINIT OOM leaves BG(unserialize) stale (level=1), the pre-RINIT rfc1867 session_start of a follow-up multipart reuses the freed struct, a controlled buffer forges var_hash so R:2 yields an IS_REFERENCE -> fake HashTable whose pDestructor is zif_system; the worker aborts after the command and FPM respawns it.",
+  "status": "RCE verified in the nginx+FPM lab: post-RINIT OOM leaves BG(unserialize) stale (level=1), the pre-RINIT rfc1867 session_start of a follow-up multipart reuses the freed struct, a controlled buffer forges var_hash so R:2 yields an IS_REFERENCE -> fake HashTable whose pDestructor is zif_system; the worker aborts after the command and FPM respawns it. The 8216-byte struct recycles between two heap slots; a mismatch self-corrects within four retries (see docs/fpm-chain.md).",
   "oom_mb": 4
 }
