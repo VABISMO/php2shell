@@ -1,4 +1,4 @@
-.PHONY: bootstrap test labs-up labs-down labs-status labs-test lint clean
+.PHONY: bootstrap test labs-up labs-down labs-status labs-test labs-fpm-up labs-fpm-down labs-fpm-status labs-fpm-test lint clean
 
 bootstrap:                     ## Fetch and pin the upstream exploit
 	python3 tools/bootstrap_upstream.py
@@ -20,6 +20,18 @@ labs-status:                   ## Show laboratory container status
 
 labs-test:                     ## Run the dispatcher against each lab
 	python3 tools/php2shell_labs.py test
+
+labs-fpm-up:                   ## Start the nginx + PHP-FPM laboratories (no Docker)
+	python3 tools/php2shell_fpm_labs.py up
+
+labs-fpm-down:                 ## Stop the nginx + PHP-FPM laboratories
+	python3 tools/php2shell_fpm_labs.py down
+
+labs-fpm-status:               ## Show FPM laboratory status
+	python3 tools/php2shell_fpm_labs.py status
+
+labs-fpm-test:                 ## Run primitive + endgame against the FPM lab
+	python3 tools/php2shell_fpm_labs.py test
 
 inventory:                     ## Print the profile and offset inventory
 	python3 tools/php2shell_inventory.py

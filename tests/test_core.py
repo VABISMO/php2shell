@@ -159,9 +159,15 @@ class InventoryTests(unittest.TestCase):
             self.assertNotIn(data["name"], names, f"duplicate profile name: {path}")
             names.add(data["name"])
             if data.get("rce"):
-                self.assertIsNotNone(data["libphp"].get("htdata"), path)
-                self.assertTrue(data["stages"].get("stage3_pads"), path)
                 self.assertIsInstance(data.get("oom_mb"), int, path)
+                if data.get("sapi") == "fpm":
+                    # the FPM chain forges the stale var_hash directly; it
+                    # does not use the Apache stage-3 htdata carrier
+                    self.assertIsNotNone(data["fpm"].get("basic_globals"), path)
+                    self.assertIsNotNone(data["fpm"].get("struct_size"), path)
+                else:
+                    self.assertIsNotNone(data["libphp"].get("htdata"), path)
+                    self.assertTrue(data["stages"].get("stage3_pads"), path)
 
     def test_profile_schema_if_present(self):
         schema = ROOT / "profiles" / "schema.json"

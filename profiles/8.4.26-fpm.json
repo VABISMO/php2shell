@@ -1,0 +1,34 @@
+{
+  "name": "php-8.4.26-fpm",
+  "php_version": "8.4.26",
+  "branch": "8.4",
+  "fixed_in": "8.4.27",
+  "sapi": "fpm",
+  "verified": true,
+  "rce": true,
+  "distro": "debian",
+  "arch": "amd64",
+  "libphp": {
+    "zif_system": "0x386660",
+    "zval_ptr_dtor": "0x54a0d0",
+    "htdata": null
+  },
+  "fpm": {
+    "basic_globals": "0xa04660",
+    "bg_unserialize_data_off": 872,
+    "bg_unserialize_level_off": 880,
+    "struct_size": 8216,
+    "reclaim_pads": [4096, 4096, 4096],
+    "reclaim_size": 12288,
+    "oracle": "/proc/<pid>/mem (local lab)"
+  },
+  "stages": {},
+  "config": {
+    "memory_limit": 8388608,
+    "display_errors": "On",
+    "session_upload_progress": "On",
+    "workers": 2
+  },
+  "status": "RCE verified in the nginx+FPM lab: post-RINIT OOM leaves BG(unserialize) stale (level=1), the pre-RINIT rfc1867 session_start of a follow-up multipart reuses the freed struct, a controlled buffer forges var_hash so R:2 yields an IS_REFERENCE -> fake HashTable whose pDestructor is zif_system; the worker aborts after the command and FPM respawns it.",
+  "oom_mb": 4
+}

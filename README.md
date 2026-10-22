@@ -15,10 +15,11 @@
 > triggers pre-RINIT out-of-memory conditions and kills Apache children.
 
 PHP2Shell is a research workspace for the `session.upload_progress` OOM /
-stale-pointer chain in PHP's Apache module. It packages a version-aware
-dispatcher, a per-build profile engine, reproducible laboratories, a calibration
-factory and runtime instrumentation around the public research exploit by
-[9bie](https://github.com/9bie/php2shell-bypass-aslr-exp).
+stale-pointer chain in PHP's Apache module, plus the PHP-FPM variant that
+exploits the same CVEs through the stale `BG(unserialize)` state. It packages a
+version-aware dispatcher, a per-build profile engine, reproducible laboratories,
+a calibration factory and runtime instrumentation around the public research
+exploit by [9bie](https://github.com/9bie/php2shell-bypass-aslr-exp).
 
 The goal is reproducible research and defensive validation, not mass
 exploitation. The dispatcher refuses to guess: it stops when the build has no
@@ -35,6 +36,7 @@ not match the profile.
 | PHP 8.5.11 amd64 | `php:8.5.11-apache` | `php-8.5.11-bookworm-amd64` | yes | yes | **yes** | separate offsets, same `htdata` |
 | PHP 8.5.10 aarch64 | `php:8.5.10-apache` | `php-8.5.10-bookworm-aarch64` | yes | yes | **yes** | `uid=33(www-data)` |
 | PHP 8.4.26 amd64 | `php:8.4.26-apache` | `php-8.4.26-bookworm-amd64` | yes | yes | **yes** | reference build |
+| PHP 8.4.26 FPM | `php:8.4.26-fpm` (nginx) | `8.4.26-fpm` | n/a | n/a | **yes** | `BG(unserialize)` chain; worker runs `uid=1000` proof |
 | PHP 8.4.25 aarch64 | `php:8.4.25-apache` | `php-8.4.25-bookworm-aarch64` | yes | yes | **yes** | probabilistic stage 3; retries |
 | PHP 8.5.0 aarch64 | `php:8.5.0-apache` | `php-8.5.0-bookworm` | yes | yes | no | stage-3 layout not found |
 | PHP 8.3.35 aarch64 | `php:8.3.35-apache` | `php-8.3.35-bookworm-aarch64` | yes | yes | no | stage-3 reference alive |
@@ -47,6 +49,9 @@ not match the profile.
 | PHP 8.2.0 aarch64 | `php:8.2.0-apache` | — (offsets only) | n/a | n/a | no | no heap profile |
 
 **13 heap profiles, 5 with verified RCE. Offsets extracted for 12 builds.**
+Plus one FPM profile (`8.4.26-fpm`) with verified RCE through the
+`BG(unserialize)` stale-state chain (no heap-leak stages; the stale struct is
+located with the oracle each run).
 
 `Heap leak` is stage 1, `libphp leak` is stage 2 and `RCE` is a real command
 proof on an isolated lab. `no` means not verified, not necessarily impossible;
@@ -75,6 +80,13 @@ default retries because its stage 3 is probabilistic.
 - **Command staging** — on local labs `-c` accepts commands of any length,
   stages them in `/out/c` and captures the output. `--script` and `--interactive`
   provide batch and REPL modes.
+- **FPM exploitation chain** — `tools/php2shell_fpm.py` exploits the same
+  CVEs against PHP-FPM behind nginx: an out-of-memory request leaves the
+  `BG(unserialize)` pointer stale, the next request reclaims the struct, and a
+  forged session variable turns the session shutdown path into `zif_system`.
+  Verified command execution on 8.4.26; `patchcheck` proves 8.4.27 is clean.
+  Requires a `/proc/<pid>/mem` oracle (`ptrace_scope=0`), so it runs in the
+  local laboratory mode (`--builder` endpoint for the 4 MB arm phase).
 - **Calibration factory** — `php2shell_calibrate.py` discovers stages 1-2 and
   verifies stage 3 with a real proof before writing `rce: true`;
   `php2shell_matrix.py` runs the factory over a matrix of images.
@@ -139,6 +151,25 @@ python3 tools/php2shell_labs.py status
 python3 tools/php2shell_inventory.py
 ```
 
+### PHP-FPM laboratory (no Docker)
+
+The FPM chain runs against a user-prefix PHP build with nginx, using the
+`/proc/<pid>/mem` oracle (`ptrace_scope=0`):
+
+```sh
+python3 tools/php2shell_fpm_labs.py up --version 8.4.26
+python3 tools/php2shell_auto.py -u http://127.0.0.1:8110/index.php --sapi fpm \
+  --builder http://127.0.0.1:8111
+# or drive the chain directly:
+python3 tools/php2shell_fpm.py endgame \
+  --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 --version 8.4.26
+python3 tools/php2shell_fpm_labs.py down
+```
+
+The consumer request exits with HTTP 502 (the worker dies after firing
+`zif_system`); the proof is written by the command itself and served statically
+from `/out/`. See [docs/fpm-chain.md](docs/fpm-chain.md).
+
 ## How it works
 
 The chain abuses the `session.upload_progress` callback that runs **before**
@@ -157,6 +188,30 @@ the request startup (pre-RINIT) and therefore before the target script:
 
 The full technical write-up, including the session lifecycle and the heap
 grooming, is in [docs/php2shell-analysis.md](docs/php2shell-analysis.md).
+
+### PHP-FPM chain
+
+The FPM lifecycle differs from mod_php: a pre-RINIT OOM kills the worker
+outright (`FPM_EXIT_SOFTWARE`), so the Apache stage-1/2/3 carrier does not
+transfer. The FPM chain instead abuses the stale `BG(unserialize)` state:
+
+1. **Arm.** An out-of-memory multipart request aborts between
+   `php_var_unserialize_init` and `php_var_unserialize_destroy`, leaving
+   `BG(unserialize).data` dangling and `level=1`. The next request that reaches
+   RINIT memsets `BG` — so the stale window is one request wide.
+2. **Locate and reclaim.** The stale 8216-byte `php_unserialize_data` struct is
+   found with the `/proc/<pid>/mem` oracle (two candidate heap slots; a mismatch
+   self-corrects on retry). A 4 MB body posted to a second endpoint (the
+   builder pool) reclaims the chunk.
+3. **Forge and fire.** The reclaimed buffer carries a fake `zend_reference`
+   whose `val` is a fake array whose `pDestructor` is `zif_system`. The consume
+   request attaches it as session variable `r`; at session shutdown
+   `zval_ptr_dtor(&PS(http_session_vars))` destroys the reference, the array
+   destructor loop calls `zif_system(frame)` with the argument at `execute_data
+   + 0x50` — a fake `zend_string` holding the command.
+
+`cmd_patchcheck` verifies the stale arm on 8.4.26 and that 8.4.27 (`level=0`)
+is clean. Details in [docs/fpm-chain.md](docs/fpm-chain.md).
 
 A profile is per build:
 
@@ -191,9 +246,12 @@ The shipped calibration targets:
   `session.use_strict_mode=0`.
 
 A hardened production PHP (128M+, `display_errors=Off`, multiple workers, FPM)
-does not match the shipped calibration. Multi-worker targets are handled with
-`--pin-workers`; `display_errors=Off` and FPM remain open research items (see
-Limitations).
+does not match the shipped Apache calibration. Multi-worker Apache targets are
+handled with `--pin-workers`; `display_errors=Off` remains an open research
+item. The FPM chain has its own requirements: nginx in front of FPM, a
+`/proc/<pid>/mem` oracle (`yama ptrace_scope=0`), a small consumer pool
+(`memory_limit=8M`, cleanup on) and a larger builder pool (64M, cleanup off)
+for the 4 MB arm phase — see [docs/fpm-chain.md](docs/fpm-chain.md).
 
 ## Multi-worker targets
 
@@ -277,7 +335,9 @@ profiles/*.json                heap profiles (offsets, heap params, verified fla
 profiles/offsets/*.json        ELF symbol offsets per image
 vendor/                        generated upstream checkout (git-ignored)
 tools/
-  php2shell_auto.py            version-aware dispatcher
+  php2shell_auto.py            version-aware dispatcher (Apache + FPM)
+  php2shell_fpm.py             PHP-FPM chain client (arm/reclaim/fire)
+  php2shell_fpm_labs.py        user-prefix FPM laboratories (no Docker)
   php2shell_calibrate.py       profile generator with proof verification
   php2shell_matrix.py          profile factory over image tags
   php2shell_rce.py             manual upstream launcher
@@ -292,8 +352,10 @@ tools/
 lab/
   wordpress/                   WordPress 8.3.33 + mod_php laboratory
   rce/                         single-worker calibration lab and configs
+  fpm/                         nginx + PHP-FPM laboratory (8.4.26 / 8.4.27)
 docs/
   php2shell-analysis.md        technical analysis
+  fpm-chain.md                 PHP-FPM chain and laboratory
   rce-guide.md                 full RCE guide and profile schema
   exploit-report.md            laboratory results
   labs.md                      laboratory reference
@@ -368,8 +430,10 @@ OOM, which is why the 8.4/8.5 stage-3 carrier does not transfer.
 
 ## Limitations
 
-- **mod_php prefork only.** PHP-FPM has a different lifecycle; the chain does
-  not transfer as-is and FPM is not supported.
+- **mod_php prefork and FPM.** The Apache chain needs prefork + `mod_php`;
+  the FPM chain needs nginx + FPM with a `/proc/<pid>/mem` oracle
+  (`ptrace_scope=0`) and two endpoints (consumer + builder pool). Other SAPIs
+  are not supported.
 - **One worker / pinning.** Without pinning, the per-worker session state breaks
   stage 1.
 - **Per-build offsets.** A profile is tied to a `libphp.so` build; the same
@@ -392,6 +456,7 @@ OOM, which is why the 8.4/8.5 stage-3 carrier does not transfer.
 ## Documentation
 
 - [Technical analysis](docs/php2shell-analysis.md)
+- [PHP-FPM chain](docs/fpm-chain.md)
 - [RCE guide and profile schema](docs/rce-guide.md)
 - [Laboratory results](docs/exploit-report.md)
 - [Laboratories](docs/labs.md)
