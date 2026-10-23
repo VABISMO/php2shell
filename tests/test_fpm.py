@@ -43,6 +43,20 @@ class MultipartTests(unittest.TestCase):
         self.assertTrue(body.endswith(b"--BOUND1--\r\n"))
 
 
+class LeakTests(unittest.TestCase):
+    def test_dechunk(self):
+        self.assertEqual(fpm._dechunk(b"4\r\nABCD\r\n0\r\n\r\n"), b"ABCD")
+        self.assertEqual(fpm._dechunk(b"plain"), b"plain")
+
+    def test_leak_geometry(self):
+        g = fpm._leak_geometry("8.4.26")
+        self.assertIsNotNone(g)
+        self.assertEqual(g["pads"], [32768, 16384])
+        self.assertEqual(g["read_len"], 0x15810)
+        self.assertEqual(g["chunk_ptr_off"], 0x77F8)
+        self.assertEqual(g["pie_ptr_off"], 0x157E8)
+
+
 class SapiRoutingTests(unittest.TestCase):
     def test_detect_sapi(self):
         self.assertEqual(auto.detect_sapi("nginx/1.26.3"), "fpm")
@@ -186,6 +200,9 @@ class FpmLabIntegrationTests(unittest.TestCase):
 
     def test_endgame_rce_proof(self):
         self.assertEqual(fpm.cmd_endgame(self._args()), 0)
+
+    def test_no_oracle_rce_proof(self):
+        self.assertEqual(fpm.cmd_no_oracle(self._args()), 0)
 
 
 if __name__ == "__main__":

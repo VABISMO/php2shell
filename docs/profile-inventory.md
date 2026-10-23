@@ -19,8 +19,10 @@ Generated from `profiles/*.json` by `tools/php2shell_inventory.py`.
 | 8.5.11 | php-8.5.11-bookworm-aarch64 | 0x5314f0 | 0x761b80 | 0x690d8 | 841 | 63 | 406 | yes |
 | 8.5.11 | php-8.5.11-bookworm-amd64 | 0x5996e0 | 0x7b47a0 | 0x690d8 | 841 | 63 | 406 | yes |
 
-**14 profiles, 6 with verified RCE** (5 Apache/mod_php + 1 PHP-FPM).
-| 8.4.26 FPM | php-8.4.26-fpm | 0x386660 | 0x54a0d0 | - | - | - | - | yes |
+**14 profiles, 6 with verified RCE** (5 Apache/mod_php + 1 PHP-FPM). The FPM
+row is an amd64 user-prefix build; its stage columns do not apply. The
+`no-oracle` path leaks the chunk and PIE bases over HTTP from the stale session
+string; the lab-only `endgame` can still read them through `/proc`.
 
 ## Per-build notes
 

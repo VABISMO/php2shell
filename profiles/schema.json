@@ -137,6 +137,110 @@
         "oracle": {
           "type": "string",
           "description": "Calibration oracle used by the lab client (e.g. /proc/<pid>/mem)."
+        },
+        "no_oracle": {
+          "type": "object",
+          "description": "HTTP-only endgame geometry: no /proc/<pid>/mem is read at exploit time.",
+          "properties": {
+            "reclaim_pads": {
+              "type": "array",
+              "items": {"type": "integer"},
+              "description": "Pad field sizes placed before the big reclaim field."
+            },
+            "reclaim_size": {
+              "type": "integer",
+              "description": "Size of the big multipart field that reclaims the stale struct."
+            },
+            "candidates": {
+              "type": "array",
+              "description": "Candidate (d offset, cover offset) pairs tried in order.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "d_off": {
+                    "type": "string",
+                    "pattern": "^0x[0-9a-fA-F]+$"
+                  },
+                  "k": {
+                    "type": "string",
+                    "pattern": "^0x[0-9a-fA-F]+$"
+                  }
+                },
+                "required": ["d_off", "k"],
+                "additionalProperties": false
+              }
+            },
+            "bases": {
+              "type": "string",
+              "description": "How the absolute bases are supplied or derived."
+            }
+          },
+          "additionalProperties": false
+        },
+        "leak": {
+          "type": "object",
+          "description": "HTTP-only base leak geometry (stale short-session string OOB read).",
+          "properties": {
+            "arm_path": {
+              "type": "string",
+              "description": "Builder script that stores the large stale session values (for example /bigvar.php)."
+            },
+            "pads": {
+              "type": "array",
+              "items": {"type": "integer"},
+              "description": "Field sizes placed before the reclaimed forged header."
+            },
+            "size": {
+              "type": "integer",
+              "description": "Reclaim buffer size in bytes."
+            },
+            "header_content_off": {
+              "type": "string",
+              "pattern": "^0x[0-9a-fA-F]+$",
+              "description": "Offset of the forged zend_string header inside the reclaim content."
+            },
+            "read_len": {
+              "type": "string",
+              "pattern": "^0x[0-9a-fA-F]+$",
+              "description": "Forged string length that spans the stale chunk and PIE pointers."
+            },
+            "chunk_ptr_off": {
+              "type": "string",
+              "pattern": "^0x[0-9a-fA-F]+$",
+              "description": "Offset of the stale zval chunk pointer in the leaked bytes."
+            },
+            "chunk_base_off": {
+              "type": "string",
+              "pattern": "^0x[0-9a-fA-F]+$",
+              "description": "Offset from the chunk pointer to the Zend-MM chunk base."
+            },
+            "pie_ptr_off": {
+              "type": "string",
+              "pattern": "^0x[0-9a-fA-F]+$",
+              "description": "Offset of the leaked execute_ex handler pointer in the leaked bytes."
+            },
+            "pie_base_off": {
+              "type": "string",
+              "pattern": "^0x[0-9a-fA-F]+$",
+              "description": "Offset from the leaked execute_ex handler pointer to the PIE base."
+            },
+            "bases": {
+              "type": "string",
+              "description": "How the bases are obtained."
+            }
+          },
+          "required": [
+            "arm_path",
+            "pads",
+            "size",
+            "header_content_off",
+            "read_len",
+            "chunk_ptr_off",
+            "chunk_base_off",
+            "pie_ptr_off",
+            "pie_base_off"
+          ],
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

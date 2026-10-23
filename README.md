@@ -36,7 +36,7 @@ not match the profile.
 | PHP 8.5.11 amd64 | `php:8.5.11-apache` | `php-8.5.11-bookworm-amd64` | yes | yes | **yes** | separate offsets, same `htdata` |
 | PHP 8.5.10 aarch64 | `php:8.5.10-apache` | `php-8.5.10-bookworm-aarch64` | yes | yes | **yes** | `uid=33(www-data)` |
 | PHP 8.4.26 amd64 | `php:8.4.26-apache` | `php-8.4.26-bookworm-amd64` | yes | yes | **yes** | reference build |
-| PHP 8.4.26 FPM | php-8.4.26 source tarball (nginx+FPM) | `8.4.26-fpm` | n/a | n/a | **yes** | `BG(unserialize)` chain; two-slot reclaim, self-correcting retries |
+| PHP 8.4.26 FPM amd64 | php-8.4.26 source tarball (nginx+FPM) | `php-8.4.26-fpm` | http (stale string) | http (stale string) | **yes** | `BG(unserialize)` chain; two-slot reclaim; HTTP-only `no-oracle` endgame |
 | PHP 8.4.25 aarch64 | `php:8.4.25-apache` | `php-8.4.25-bookworm-aarch64` | yes | yes | **yes** | probabilistic stage 3; retries |
 | PHP 8.5.0 aarch64 | `php:8.5.0-apache` | `php-8.5.0-bookworm` | yes | yes | no | stage-3 layout not found |
 | PHP 8.3.35 aarch64 | `php:8.3.35-apache` | `php-8.3.35-bookworm-aarch64` | yes | yes | no | stage-3 reference alive |
@@ -49,16 +49,22 @@ not match the profile.
 | PHP 8.2.0 aarch64 | `php:8.2.0-apache` | — (offsets only) | n/a | n/a | no | no heap profile |
 
 **14 profiles (13 heap + 1 FPM), 6 with verified RCE. Offsets extracted for
-12 builds.** The FPM profile has no heap-leak stages: the stale
-`BG(unserialize)` struct is located with the oracle each run
-([docs/fpm-chain.md](docs/fpm-chain.md)).
+12 builds.** The FPM profile has no Apache leak stages: `endgame` resolves the stale
+`BG(unserialize)` struct and the php-fpm PIE base with the
+`/proc/<pid>/mem` oracle each run; `no-oracle` leaks the two absolute bases
+over HTTP from a stale-session string OOB read, or takes them from
+`--chunk`/`--pie` or local `/proc/<pid>/maps`, then brute-forces the two
+slots ([docs/fpm-chain.md](docs/fpm-chain.md)).
 
-`Heap leak` is stage 1, `libphp leak` is stage 2 and `RCE` is a real command
-proof on an isolated lab. `no` means not verified, not necessarily impossible;
-`n/a` means no heap profile exists for that build. The 8.2.0 row is an
-offsets-only entry. All `yes` rows use the lab configuration: Apache prefork
+`Heap leak` is stage 1 and `libphp leak` is stage 2; `oracle (heap)` and
+`oracle (PIE)` mean the FPM chain reads the heap chunk and the php-fpm PIE base
+from `/proc/<pid>/mem` in local lab mode instead. `RCE` is a real command proof
+on an isolated lab. `no` means not verified, not necessarily impossible; `n/a`
+means no heap profile exists for that build. The 8.2.0 row is an
+offsets-only entry. All `yes` Apache rows use the lab configuration: prefork
 `mod_php`, one worker, `display_errors=On`, `memory_limit=8M` and
-`session.upload_progress=On`. Per-image offsets and `libphp` sha256 are in
+`session.upload_progress=On`; the FPM row uses the nginx+FPM lab. Per-image
+offsets and `libphp` sha256 are in
 [the offset inventory](docs/offset-inventory.md). The 8.4.25 profile needs the
 default retries because its stage 3 is probabilistic.
 
@@ -153,8 +159,9 @@ python3 tools/php2shell_inventory.py
 
 ### PHP-FPM laboratory (no Docker)
 
-The FPM chain runs against a user-prefix PHP build with nginx, using the
-`/proc/<pid>/mem` oracle (`ptrace_scope=0`):
+The FPM chain runs against an amd64 user-prefix PHP build with nginx. The
+default `endgame` uses the `/proc/<pid>/mem` oracle (`ptrace_scope=0`);
+`no-oracle` avoids it at exploit time and leaks chunk/PIE over HTTP by default:
 
 ```sh
 python3 tools/php2shell_fpm_labs.py up --version 8.4.26
@@ -164,6 +171,13 @@ python3 tools/php2shell_auto.py -u http://127.0.0.1:8110/index.php --sapi fpm \
 python3 tools/php2shell_fpm.py \
   --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 --version 8.4.26 \
   endgame
+# no /proc/<pid>/mem at exploit time (HTTP leak; --chunk/--pie override)
+python3 tools/php2shell_fpm.py \
+  --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 --version 8.4.26 \
+  --command 'id>out/p1' --proof-file out/p1 no-oracle
+# print only the leaked bases
+python3 tools/php2shell_fpm.py \
+  --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 --version 8.4.26 leak
 python3 tools/php2shell_fpm_labs.py down
 ```
 
@@ -202,8 +216,9 @@ transfer. The FPM chain instead abuses the stale `BG(unserialize)` state:
    RINIT memsets `BG` — so the stale window is one request wide.
 2. **Locate and reclaim.** The stale 8216-byte `php_unserialize_data` struct is
    found with the `/proc/<pid>/mem` oracle (two candidate heap slots; a mismatch
-   self-corrects on retry). A 4 MB body posted to a second endpoint (the
-   builder pool) reclaims the chunk.
+   self-corrects on retry); `no-oracle` skips the mem read and tries both slots
+   directly. A 4 MB body posted to a second endpoint (the builder pool)
+   reclaims the chunk.
 3. **Forge and fire.** The reclaimed buffer carries a fake `zend_reference`
    whose `val` is a fake array whose `pDestructor` is `zif_system`. The consume
    request attaches it as session variable `r`; at session shutdown
@@ -236,6 +251,10 @@ offsets:
 - remote target: `--arch aarch64|amd64` (or `--profile NAME`) is **required**,
   even when the version has a single profile. HTTP does not expose the CPU
   architecture, so the dispatcher refuses instead of guessing.
+
+The FPM profile (`php-8.4.26-fpm`) is an **amd64** user-prefix build of the
+8.4.26 source tarball. It runs only in the local nginx+FPM laboratory, so the
+oracle selects the build and there is no remote architecture dispatch.
 
 ## Configuration requirements
 

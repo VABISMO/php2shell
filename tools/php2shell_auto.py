@@ -148,10 +148,10 @@ def proof_path_from_command(command: str, default: str = "out/p1") -> str:
 def run_fpm_chain(ui, args, version: str) -> int:
     """Route an nginx+PHP-FPM target to tools/php2shell_fpm.py.
 
-    The FPM chain (stale BG(unserialize) after a post-RINIT OOM) currently
-    calibrates the reclaim geometry through the local /proc oracle, so it
-    only runs against loopback lab targets.  Remote FPM exploitation needs
-    a leak primitive and is future work."""
+    The FPM chain (stale BG(unserialize) after a post-RINIT OOM) still needs
+    the lab builder/session endpoints and, for `endgame`, the local /proc
+    oracle.  `no-oracle` can leak the chunk/PIE bases over HTTP, but the
+    shipped dispatcher remains loopback-only."""
     import php2shell_fpm as fpm
 
     host = urllib.parse.urlsplit(
@@ -159,7 +159,7 @@ def run_fpm_chain(ui, args, version: str) -> int:
     ).hostname or ""
     if not is_loopback(host):
         ui.crit("the FPM chain needs local /proc oracle access (lab mode)")
-        ui.info("remote FPM exploitation requires a leak primitive (future work)")
+        ui.info("remote FPM still requires the builder/session endpoints (lab-only)")
         ui.result(False, "FPM REMOTE UNSUPPORTED", f"PHP {version} behind a non-loopback front")
         return 3
 
