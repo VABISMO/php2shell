@@ -6,9 +6,12 @@ needs a pre-RINIT out-of-memory bailout. Under PHP-FPM that bailout is fatal:
 Apache progress-cache UAF never survives to the next request.
 
 The FPM-viable primitive is the **stale `BG(unserialize)` state** — the same
-CVEs through a different window. Verified end-to-end on PHP 8.4.26 (amd64,
-Debian) in the local laboratory; `cmd_patchcheck` confirms 8.4.27 leaves
-`level=0` (clean).
+CVEs through a different window. Verified end-to-end on PHP 8.2.34, 8.3.35,
+8.4.0, 8.4.25 and 8.4.26 (amd64, Debian-style user-prefix builds) in the local
+laboratory; `cmd_patchcheck` confirms 8.4.27 leaves `level=0` (clean). PHP
+<= 7.x cannot use this struct-freeing chain, but the same
+`session.upload_progress` surface gives a pre-auth **session-file plant**
+(`poison`), covered below.
 
 > **Authorized testing only.** The chain is disruptive: it sends multi-megabyte
 > bodies, triggers out-of-memory conditions and kills FPM workers. Use it only
@@ -29,6 +32,25 @@ two ways:
 The chain therefore has to *re-claim* the stale struct inside the request that
 still sees it, before RINIT runs. The rfc1867 multipart upload handler gives
 exactly that window.
+
+## Affected versions
+
+`tools/php2shell_fpm_versions.py` is the single source of truth for the
+affected-version matrix. Every release before the branch fix is vulnerable:
+
+| Branch | Vulnerable | Fixed | This repository |
+| --- | --- | --- | --- |
+| 8.4 | 8.4.0 – 8.4.26 | 8.4.27 | **verified profiles (8.4.0, 8.4.25, 8.4.26)** |
+| 8.3 | 8.3.0 – 8.3.35 | 8.3.36 | **verified profile (8.3.35)** |
+| 8.2 | 8.2.0 – 8.2.34 | 8.2.35 | **verified profile (8.2.34)** |
+| 7.4 / 7.2 (and older) | every release | **never patched** | session-file plant (`poison`); no struct-freeing chain |
+
+(PHP 8.5 is fixed in 8.5.12 and is intentionally out of scope here.)
+`is_vulnerable()`, `fixed_in()`, `affected_versions()` and `source_is_fixed()`
+(which classifies a tarball by the presence of the upstream fix marker rather
+than a version string) all resolve through that registry, and
+`has_session_cancel_decode()` decides whether the struct-freeing chain can
+apply to a build at all (it needs PHP 8.0+).
 
 ## The chain
 
@@ -192,8 +214,17 @@ target arguments.
 
 | Build | chain HTTP | builder HTTP | chain FPM | builder FPM |
 | --- | --- | --- | --- | --- |
+| 7.2.34 | :8268 | :8269 | :9168 | :9169 |
+| 7.4.33 | :8336 | :8337 | :9236 | :9237 |
+| 8.2.34 | :8406 | :8407 | :9306 | :9307 |
+| 8.3.35 | :8478 | :8479 | :9378 | :9379 |
+| 8.4.0 | :8480 | :8481 | :9380 | :9381 |
+| 8.4.25 | :8130 | :8131 | :9021 | :9022 |
 | 8.4.26 | :8110 | :8111 | :9001 | :9002 |
 | 8.4.27 | :8120 | :8121 | :9011 | :9012 |
+
+Every other built version gets a block of its own from
+`php2shell_fpm_labs.builds_map()` (`make labs-fpm-ports` prints the mapping).
 
 Pools (from `lab/fpm/php-fpm.conf.in`):
 
@@ -211,7 +242,7 @@ Requirements: Python 3.11+, gcc for the user-prefix PHP builds
 ptrace_scope=0` for the `/proc/<pid>/mem` oracle; `no-oracle` does not.
 
 ```sh
-python3 tools/php2shell_fpm_labs.py up --version 8.4.26
+python3 tools/php2shell_fpm_labs.py up --only 8.4.26
 python3 tools/php2shell_fpm_labs.py status
 python3 tools/php2shell_fpm_labs.py smoke
 python3 tools/php2shell_fpm_labs.py test      # primitive + endgame end-to-end
@@ -264,9 +295,81 @@ python3 tools/php2shell_auto.py \
 Tests: the unit suite always runs; the live lab tests are gated:
 
 ```sh
-python3 -m unittest discover -s tests -v          # 51 tests, skips live FPM
+python3 -m unittest discover -s tests -v          # unit suite, skips live FPM
 PHP2SHELL_FPM_LAB=1 python3 -m unittest \
   tests.test_fpm.FpmLabIntegrationTests -v        # primitive + endgame + no-oracle live
+```
+
+## Session-file plant (PHP 5.4-8.x, `poison`)
+
+The other half of `session.upload_progress` works on **every** version,
+including PHP <= 7.x where the struct-freeing chain does not apply:
+
+1. `MULTIPART_EVENT_FORMDATA` copies the session id **from the POST body**
+   without consulting `session.use_only_cookies`;
+2. `MULTIPART_EVENT_FILE_START` installs it as `PS(id)` and writes the progress
+   data there — kept by `session.upload_progress.cleanup=Off` on the builder;
+3. the upload **filename** is stored and serialized into that file, so chosen
+   bytes land in a session file of the attacker's choosing
+   (`php_session_valid_key` limits the name to `[a-zA-Z0-9,-]`, so it is inside
+   `save_path`, not a path traversal);
+4. the application deserializes the file on its next `session_start()` and
+   reflects it — over HTTP, no `/proc` anywhere.
+
+```sh
+python3 tools/php2shell_fpm.py --version 7.4.33 \
+  --base http://127.0.0.1:8336 --builder http://127.0.0.1:8337 \
+  poison --sid plant7x --payload 'PLANTED_MARKER'
+```
+
+This is arbitrary **session-file write** pre-auth, not RCE by itself: the
+serializer rejects keys containing `|` (so the key cannot smuggle objects) and
+the files handler validates the id, which rules out path traversal. Turning the
+plant into code execution needs an application gadget or a local file include
+in the target — which is why PHP <= 7.x is reported as *session plant* and RCE
+is reserved for 8.0+, where the struct-freeing chain applies.
+
+## Remote calibration (`calibrate`)
+
+`calibrate` derives everything a profile needs **with HTTP requests only** —
+no `/proc`, no local shell, no FPM PID. It is the same traffic the exploit
+sends, so a build that calibrates is a build that exploits:
+
+```sh
+python3 tools/php2shell_fpm.py \
+  --version 8.2.34 --base http://127.0.0.1:8406 --builder http://127.0.0.1:8407 \
+  calibrate
+```
+
+Three phases, each validated by the answer of the target:
+
+1. **Leak geometry** — the forged `zend_string` header is tried at a few
+   content offsets; accepted when two consecutive OOB reads expose a chunk and
+   a PIE pointer at the *same* offsets (which also fixes `chunk_base_off`).
+2. **Reclaim geometry** — a forged `IS_LONG` zval reflected by `app.php` needs
+   no PIE base, so it isolates the heap geometry (pad/size shapes and
+   `(chunk offset, content offset)` pairs).
+3. **PIE base** — the leaked pointer is rounded to 2 MB boundaries and each
+   candidate is proven with a remote endgame until the proof file appears.
+
+The result is written into `profiles/<version>-fpm.json`; `no-oracle` then
+reproduces the RCE against that build.
+
+## Unpatched matrix (`php2shell_fpm_matrix.py`)
+
+`make matrix` (or `python3 tools/php2shell_fpm_matrix.py`) verifies the remote
+chain on every unpatched build, one lab at a time so the ports never fight. For
+each version it starts the lab, calibrates the profile over HTTP when it is not
+verified yet, runs the 100%-remote `no-oracle` endgame, and prints one line per
+version (patched releases are skipped by design):
+
+```text
+7.2.34    SESSION PLANT      pre-auth write into sess_<sid>
+7.4.33    SESSION PLANT      pre-auth write into sess_<sid>
+8.2.34    REMOTE RCE         uid=1000(...) ...
+8.3.35    REMOTE RCE         uid=1000(...) ...
+8.4.25    REMOTE RCE         uid=1000(...) ...
+8.4.26    REMOTE RCE         uid=1000(...) ...
 ```
 
 ## Limitations and future work
