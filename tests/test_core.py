@@ -20,9 +20,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 
 import php2shell_auto as auto  # noqa: E402
-import php2shell_ui as ui  # noqa: E402
-import php2shell_paths as paths  # noqa: E402
 import php2shell_calibrate as cal  # noqa: E402
+import php2shell_paths as paths  # noqa: E402
+import php2shell_ui as ui  # noqa: E402
 
 
 class ClassificationTests(unittest.TestCase):
@@ -147,7 +147,7 @@ class InventoryTests(unittest.TestCase):
     def test_profiles_are_valid(self):
         names = set()
         for path in sorted((ROOT / "profiles").glob("*.json")):
-            if path.name == "schema.json":
+            if path.name in ("schema.json", "fpm-schema.json"):
                 continue
             data = json.loads(path.read_text())
             self.assertIn("name", data, path)

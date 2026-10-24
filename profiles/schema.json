@@ -374,6 +374,10 @@
         "minimum": 1
       },
       "description": "memory_limit values (in MiB) where RCE was verified."
+    },
+    "layout": {
+      "type": "object",
+      "description": "Compiled struct-layout offsets for this PHP-FPM build. The strict per-field shape is validated by profiles/fpm-schema.json; this generic schema only asserts it is an object."
     }
   },
   "allOf": [
