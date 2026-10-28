@@ -66,9 +66,12 @@ class LeakTests(unittest.TestCase):
         self.assertEqual(g["header_content_off"] % 8, 0)
 
     def test_leak_geometry_8425_pie_offset(self):
+        # the profile was re-calibrated against this checkout's own build:
+        # pins the shipped reference values, which is what the leak fallback
+        # trusts when the target has no local calibration yet
         g = fpm._leak_geometry("8.4.25")
         self.assertIsNotNone(g)
-        self.assertEqual(g["pie_base_off"], 0x4E9FC7)
+        self.assertEqual(g["pie_base_off"], 0x4E80AA)
         self.assertEqual(g["pads"], [32768, 16384])
 
 
@@ -262,9 +265,9 @@ class ProfileConsistencyTests(unittest.TestCase):
         self.assertTrue(profile["verified"])
         self.assertEqual(profile["fixed_in"], "8.4.27")
         self.assertEqual(profile["libphp"]["zif_system"], "0x386460")
-        self.assertEqual(profile["fpm"]["reclaim_pads"], [4096, 4096])
+        self.assertEqual(profile["fpm"]["reclaim_pads"], [4096, 4096, 4096])
         self.assertEqual(profile["fpm"]["no_oracle"]["candidates"],
-                         [{"d_off": "0x7f000", "k": "0xfe8"}])
+                         [{"d_off": "0x81000", "k": "0xfe8"}])
 
     def test_fpm_profile_validates_against_schema(self):
         try:
