@@ -55,7 +55,8 @@ jobs:
 
           schema = json.loads(Path("profiles/schema.json").read_text())
           for path in sorted(Path("profiles").glob("*.json")):
-              if path.name in ("schema.json", "fpm-schema.json"):
+              if path.name in ("schema.json", "fpm-schema.json",
+                               "verification.json"):
                   continue
               jsonschema.validate(json.loads(path.read_text()), schema)
               print(f"{path}: valid")
