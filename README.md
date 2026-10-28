@@ -41,6 +41,10 @@ not match the profile.
 | PHP 8.4.0 FPM amd64 | php-8.4.0 source tarball (nginx+FPM) | `php-8.4.0-fpm` | http (stale string) | http (stale string) | **yes** | earliest 8.4 release of the branch |
 | PHP 8.3.35 FPM amd64 | php-8.3.35 source tarball (nginx+FPM) | `php-8.3.35-fpm` | http (stale string) | http (stale string) | **yes** | last vulnerable 8.3 |
 | PHP 8.2.34 FPM amd64 | php-8.2.34 source tarball (nginx+FPM) | `php-8.2.34-fpm` | http (stale string) | http (stale string) | **yes** | last vulnerable 8.2 |
+| PHP 8.1.33 FPM amd64 | php-8.1.33 source tarball (nginx+FPM) | `php-8.1.33-fpm` | http (stale string) | http (stale string) | **yes** | same chain; the stale struct is reclaimed from 7.4 on |
+| PHP 8.0.30 FPM amd64 | php-8.0.30 source tarball (nginx+FPM) | `php-8.0.30-fpm` | http (stale string) | http (stale string) | **yes** | same chain |
+| PHP 7.4.33 FPM amd64 | php-7.4.33 source tarball (nginx+FPM) | `php-7.4.33-fpm` | http (stale string) | http (stale string) | **yes** | same chain; `poison` also works |
+| PHP 7.2.34 FPM amd64 | php-7.2.34 source tarball (nginx+FPM) | `php-7.2.34-fpm` | no | no | no | arms the stale state; reclaim shape not found - `poison` plant |
 | PHP 8.4.25 aarch64 | `php:8.4.25-apache` | `php-8.4.25-bookworm-aarch64` | yes | yes | **yes** | probabilistic stage 3; retries |
 | PHP 8.5.0 aarch64 | `php:8.5.0-apache` | `php-8.5.0-bookworm` | yes | yes | no | stage-3 layout not found |
 | PHP 8.3.35 aarch64 | `php:8.3.35-apache` | `php-8.3.35-bookworm-aarch64` | yes | yes | no | stage-3 reference alive |
@@ -52,7 +56,7 @@ not match the profile.
 | PHP 7.4.33 aarch64 | `php:7.4-apache` | `php-7.4.33-bookworm-aarch64` | no | no | no | UAF; leak shape differs |
 | PHP 8.2.0 aarch64 | `php:8.2.0-apache` | — (offsets only) | n/a | n/a | no | no heap profile |
 
-**18 profiles (13 Apache/mod_php + 5 PHP-FPM), 10 with verified RCE. Offsets
+**21 profiles (13 Apache/mod_php + 8 PHP-FPM), 13 with verified RCE. Offsets
 extracted for 12 Apache builds.** The PHP-FPM profiles have no Apache leak
 stages: the chain abuses the stale `BG(unserialize)` struct instead.
 `no-oracle` is fully remote — it leaks the chunk and php-fpm PIE bases over
@@ -95,13 +99,18 @@ default retries because its stage 3 is probabilistic.
   CVEs against PHP-FPM behind nginx: an out-of-memory request leaves the
   `BG(unserialize)` pointer stale, the next request reclaims the struct, and a
   forged session variable turns the session shutdown path into `zif_system`.
-  Verified command execution on 8.2.34, 8.3.35, 8.4.0, 8.4.25 and 8.4.26;
-  `patchcheck` proves 8.4.27 is clean. `calibrate` derives the leak and
-  reclaim geometry of any 8.0+ build over HTTP only; `poison` (the
-  `session.upload_progress` session-file plant) covers PHP 5.4-7.x where the
-  struct-freeing chain does not apply; `php2shell_fpm_matrix.py` verifies the
-  whole unpatched set in one run. The `no-oracle` endgame is fully remote —
-  no `/proc/<pid>/mem`, no local shell.
+  Verified command execution over HTTP on 7.4.33, 8.0.30, 8.1.33, 8.2.34,
+  8.3.35, 8.4.0, 8.4.25 and 8.4.26 (the stale struct is reclaimed from 7.4
+  on — `php_session_cancel_decode` only unlinks the session file); `patchcheck`
+  proves 8.4.27 is clean. Two arm modes: the single-surface amplified
+  `session_decode` for stock installations and the classic two-surface
+  builder; `--workers` fans the arm/consume over a default `pm=dynamic` pool;
+  `probe` reports which preconditions a target satisfies. `calibrate` derives
+  the leak and reclaim geometry of any 7.4+ build over HTTP only;
+  `poison` (the `session.upload_progress` session-file plant) covers 5.x and
+  7.2; `php2shell_fpm_matrix.py` verifies the whole unpatched set in one run
+  and records the verdicts in `profiles/verification.json`. The `no-oracle`
+  endgame is fully remote — no `/proc/<pid>/mem`, no local shell.
 - **PHP version registry** — `tools/php2shell_fpm_versions.py` is the single
   source of truth for the affected-version matrix: `is_vulnerable()`,
   `fixed_in()`, `source_is_fixed()` classifies a tarball by the presence of the
@@ -173,8 +182,9 @@ python3 tools/php2shell_inventory.py
 ### PHP-FPM laboratory (no Docker)
 
 The FPM chain runs against an amd64 user-prefix PHP build with nginx — no
-Docker, no root. Build nginx and a vulnerable PHP (any of 8.2.34, 8.3.35,
-8.4.0, 8.4.25 or 8.4.26), then start the lab for that version:
+Docker, no root. Build nginx and a vulnerable PHP (any of 7.4.33, 8.0.30,
+8.1.33, 8.2.34, 8.3.35, 8.4.0, 8.4.25 or 8.4.26), then start the lab for
+that version:
 
 ```sh
 lab/fpm/build_nginx.sh
@@ -197,17 +207,27 @@ python3 tools/php2shell_fpm.py \
 python3 tools/php2shell_fpm.py \
   --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 --version 8.4.26 \
   --command 'id>out/p1' --proof-file out/p1 no-oracle
+# stock installation shape: --builder defaults to --base, one port, one pool,
+# memory_limit=128M, pm=dynamic x5 workers, stock php.ini (nginx needs
+# client_max_body_size >= 5m for the arm body)
+python3 tools/php2shell_fpm.py \
+  --base http://target --version 8.4.26 \
+  --command 'id>out/p1' --proof-file out/p1 no-oracle
+# checklist: does this target meet every precondition of the chain?
+python3 tools/php2shell_fpm.py --base http://target --version 8.4.26 probe
 # print only the leaked bases
 python3 tools/php2shell_fpm.py \
   --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 --version 8.4.26 leak
-# derive a profile for any 8.0+ build over HTTP, then trust it:
+# derive a profile for any 7.4+ build over HTTP, then trust it:
 python3 tools/php2shell_fpm.py \
   --version 8.2.34 --base http://127.0.0.1:8406 --builder http://127.0.0.1:8407 calibrate
-# PHP <= 7.x: plant chosen bytes into a chosen session file (pre-auth)
+# 5.x and 7.2 (no verified reclaim): plant chosen bytes into a chosen
+# session file (pre-auth write, needs an app gadget for code execution)
 python3 tools/php2shell_fpm.py \
   --version 7.4.33 --base http://127.0.0.1:8336 --builder http://127.0.0.1:8337 \
   poison --sid plant7x --payload 'PLANTED_MARKER'
-# verify the remote chain on every unpatched build in one run (7.2 -> 8.4)
+# verify the remote chain on every unpatched build in one run
+# (7.2 is recorded as SESSION PLANT, 7.4+ as REMOTE RCE)
 python3 tools/php2shell_fpm_matrix.py
 python3 tools/php2shell_fpm_labs.py down
 ```
@@ -299,11 +319,33 @@ The shipped calibration targets:
 A hardened production PHP (128M+, `display_errors=Off`, multiple workers, FPM)
 does not match the shipped Apache calibration. Multi-worker Apache targets are
 handled with `--pin-workers`; `display_errors=Off` remains an open research
-item. The FPM chain has its own requirements: nginx in front of FPM, a small
-consumer pool (`memory_limit=8M`, cleanup on) and a larger builder pool (64M,
-cleanup off) for the 4 MB arm phase, sharing a session directory. The
-`no-oracle` endgame is fully remote; only the lab `endgame`/`primitive` modes
-additionally need `/proc/<pid>/mem` (`yama ptrace_scope=0`) — see
+item. The FPM chain runs against two supported shapes — run `probe` against a
+target to see which ones its configuration satisfies:
+
+- **Stock installation (single surface, `--arm-mode growth`, auto when
+  `--builder` equals `--base`):** one nginx port, one pool,
+  `memory_limit=128M`, `pm=dynamic` with any worker count,
+  `post_max_size=8M`, `session.upload_progress.cleanup=On`, the `php`
+  serializer and `files` storage — the php.ini production defaults. The
+  arm is an amplified `session_decode` (a wide nested-array payload whose
+  decode multiplies memory ~22x while `BG(unserialize).level == 1`), so no
+  big session file and no `memory_limit` split are involved. The front must
+  pass ~5 MB bodies: nginx needs `client_max_body_size 5m` (stock `1m` is
+  too small to push 128M over; Apache has no such default cap). The
+  application must provide four operations: `session_start()`, a stored
+  reference (`R:N`), a reflected session value, and either a
+  `session_decode()` of attacker data or session accumulation
+  (`--grow-path`).
+- **Classic builder (two surfaces, `--arm-mode builder`):** a consumer pool
+  low enough that decoding the 4 MB arm OOMs after RINIT and a builder
+  surface high enough to persist it, sharing a session directory — both
+  behind one port with `--builder-prefix` if you want a single origin.
+
+The leak geometry is *per environment* (the freed-string slot depends on the
+build's allocator and the checkout paths): run `calibrate` once per host
+before trusting `no-oracle` there. The `no-oracle` endgame is fully remote;
+only the lab `endgame`/`primitive` modes additionally need
+`/proc/<pid>/mem` (`yama ptrace_scope=0`) — see
 [docs/fpm-chain.md](docs/fpm-chain.md).
 
 ## Multi-worker targets
@@ -321,6 +363,12 @@ For loopback targets the count is detected automatically. For remote targets
 pinning is **opt-in**: it opens keep-alive connections until a request stops
 being answered, which is intrusive and only appropriate on authorized
 infrastructure. `--pin-max N` bounds the connections (default 32).
+
+The PHP-FPM chain does not pin: it **fans out** instead. `--workers N`
+(default 5, matching `pm.max_children` of a stock pool) repeats the arm over
+the pool and repeats the consume, so every worker is armed and the fire lands
+on an armed one without holding connections open. A failed attempt on an
+unarmed worker is a no-op request; the armed workers stay standing.
 
 ## Commands and proof
 
@@ -494,16 +542,20 @@ OOM, which is why the 8.4/8.5 stage-3 carrier does not transfer.
 ## Limitations
 
 - **mod_php prefork and FPM.** The Apache chain needs prefork + `mod_php`; the
-  FPM chain needs nginx + FPM with two endpoints (a low-memory consumer pool and
-  a high-memory builder pool) and a session directory shared between them. Only
-  the lab-only `endgame`/`primitive` oracle modes need `/proc/<pid>/mem`
+  FPM chain needs nginx + FPM — either the stock single-pool shape (amplifier
+  arm, ~5 MB bodies through the front, four application session operations)
+  or the classic two surfaces (a low-memory consumer pool and a high-memory
+  builder pool sharing a session directory). Only the lab-only
+  `endgame`/`primitive` oracle modes need `/proc/<pid>/mem`
   (`ptrace_scope=0`); `no-oracle` is fully remote. Other SAPIs are not
   supported.
 - **One worker / pinning.** Without pinning, the per-worker session state breaks
-  stage 1.
+  stage 1 (the Apache chain pins; the FPM chain fans out with `--workers`).
 - **Per-build offsets.** A profile is tied to a `libphp.so` build; the same
-  version from another distribution or architecture needs its own offsets and
-  heap calibration.
+  version from another distribution, architecture, or even a different
+  checkout path (the compile-time prefix shifts the heap) needs its own
+  `calibrate` run — the FPM leak geometry in particular is
+  environment-specific.
 - **`display_errors=Off` is not complete.** The OOM-in-cookie primitive is
   reproducible in research, but the stage-1 leak is not shipped for that
   configuration.

@@ -127,7 +127,9 @@
         },
         "reclaim_pads": {
           "type": "array",
-          "items": {"type": "integer"},
+          "items": {
+            "type": "integer"
+          },
           "description": "Pad field sizes placed before the big reclaim field."
         },
         "reclaim_size": {
@@ -144,7 +146,9 @@
           "properties": {
             "reclaim_pads": {
               "type": "array",
-              "items": {"type": "integer"},
+              "items": {
+                "type": "integer"
+              },
               "description": "Pad field sizes placed before the big reclaim field."
             },
             "reclaim_size": {
@@ -166,7 +170,10 @@
                     "pattern": "^0x[0-9a-fA-F]+$"
                   }
                 },
-                "required": ["d_off", "k"],
+                "required": [
+                  "d_off",
+                  "k"
+                ],
                 "additionalProperties": false
               }
             },
@@ -187,7 +194,9 @@
             },
             "pads": {
               "type": "array",
-              "items": {"type": "integer"},
+              "items": {
+                "type": "integer"
+              },
               "description": "Field sizes placed before the reclaimed forged header."
             },
             "size": {
@@ -241,6 +250,49 @@
             "pie_base_off"
           ],
           "additionalProperties": false
+        },
+        "growth": {
+          "type": "object",
+          "description": "geometry of the single-surface amplifier arm (default-installation mode); absent means the classic two-surface arm geometry applies",
+          "properties": {
+            "leak": {
+              "$ref": "#/properties/fpm/properties/leak"
+            },
+            "candidates": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": [
+                  "d_off",
+                  "k"
+                ],
+                "properties": {
+                  "d_off": {
+                    "type": "string",
+                    "pattern": "^0x[0-9a-fA-F]+$"
+                  },
+                  "k": {
+                    "type": "string",
+                    "pattern": "^0x[0-9a-fA-F]+$"
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "reclaim_pads": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "reclaim_size": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
@@ -250,22 +302,34 @@
       "description": "Heap calibration parameters for each exploit stage.",
       "properties": {
         "stage1_n": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 1,
           "description": "Number of multipart fields to place before the forged block in stage 1. Null when not calibrated."
         },
         "stage1_forge_len": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 1,
           "description": "Byte length of the forged zend_string block in stage 1. Null when not calibrated."
         },
         "stage2_t": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 1,
           "description": "Target field index for the stage-2 libphp pointer leak. Null when not calibrated."
         },
         "stage2_v": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 1,
           "description": "Value parameter for stage-2 calibration. Null when not calibrated."
         },
@@ -323,31 +387,49 @@
       "description": "Addresses observed during calibration (informational, not used at runtime).",
       "properties": {
         "chunk_base": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^0x[0-9a-fA-F]+$",
           "description": "Zend MM chunk base address from stage-1 leak. Null when not leaked."
         },
         "libphp_base": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^0x[0-9a-fA-F]+$",
           "description": "libphp.so load base from stage-2 leak. Null when not leaked."
         },
         "chunk_base_example": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^0x[0-9a-fA-F]+$",
           "description": "Example chunk base observed on a similar build (informational)."
         },
         "libphp_base_example": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^0x[0-9a-fA-F]+$",
           "description": "Example libphp base observed on a similar build (informational)."
         },
         "stage3_http_session_vars": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "description": "Chunk-relative shape of $_SESSION storage observed during calibration."
         },
         "stage3_ref_buffers": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "description": "Chunk-relative shape of the reference buffers observed during calibration."
         }
       },
@@ -391,7 +473,10 @@
             "const": "apache2handler"
           }
         },
-        "required": ["rce", "sapi"]
+        "required": [
+          "rce",
+          "sapi"
+        ]
       },
       "then": {
         "required": [
@@ -441,7 +526,10 @@
             "const": "fpm"
           }
         },
-        "required": ["rce", "sapi"]
+        "required": [
+          "rce",
+          "sapi"
+        ]
       },
       "then": {
         "required": [

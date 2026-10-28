@@ -43,14 +43,22 @@ affected-version matrix. Every release before the branch fix is vulnerable:
 | 8.4 | 8.4.0 – 8.4.26 | 8.4.27 | **verified profiles (8.4.0, 8.4.25, 8.4.26)** |
 | 8.3 | 8.3.0 – 8.3.35 | 8.3.36 | **verified profile (8.3.35)** |
 | 8.2 | 8.2.0 – 8.2.34 | 8.2.35 | **verified profile (8.2.34)** |
-| 7.4 / 7.2 (and older) | every release | **never patched** | session-file plant (`poison`); no struct-freeing chain |
+| 8.1, 8.0 | every release | **never patched** | **verified profiles (8.1.33, 8.0.30)** - same chain |
+| 7.4 | every release | **never patched** | **verified profile (7.4.33)** - same chain |
+| 7.2 | every release | **never patched** | arms the stale state, no reclaim shape found - session-file plant (`poison`) |
+| 5.x | every release | **never patched** | no `zend_reference` for the endgame - session-file plant (`poison`) |
 
 (PHP 8.5 is fixed in 8.5.12 and is intentionally out of scope here.)
 `is_vulnerable()`, `fixed_in()`, `affected_versions()` and `source_is_fixed()`
 (which classifies a tarball by the presence of the upstream fix marker rather
-than a version string) all resolve through that registry, and
-`has_session_cancel_decode()` decides whether the struct-freeing chain can
-apply to a build at all (it needs PHP 8.0+).
+than a version string) all resolve through that registry. The stale struct is
+reclaimed on every branch from 7.4 up: `php_var_unserialize_init()` reuses
+`BG(unserialize).data` whenever `level > 0`, the Zend memory manager frees
+that emalloc block at request end on every version, and
+`php_session_cancel_decode()` (8.2+) only *unlinks the session file* - it
+never touches the struct. An early version of this document claimed the chain
+needs 8.2+ because of that function; HTTP-only calibration runs on 7.4.33,
+8.0.30 and 8.1.33 (`uid=1000` proofs) disproved it.
 
 ## The chain
 
@@ -85,6 +93,24 @@ catches the bailout, the worker survives, and `BG(unserialize)` keeps
 At this point `d` is dangling: the only live reference in the engine is the
 stale `BG` pair. Every subsequent request that reaches RINIT memsets `BG`, so
 the consumer must arrive *before* its own RINIT.
+
+Two ways to reach this arm, selected with `--arm-mode` (`auto` picks by
+origin - growth when `--builder` equals `--base` without a prefix):
+
+- **classic builder** (above): a second surface with a higher
+  `memory_limit` writes the 4 MB session. Both surfaces can share one port
+  behind `--builder-prefix /b`.
+- **growth (stock installations, single surface):** no big session file and
+  no `memory_limit` split. The client POSTs an amplified `session_decode`
+  payload to `--grow-path` (default `/grow.php`): four short strings (the
+  leak's `R:2` hook reads `data[1]`) followed by a wide array of nested
+  sub-arrays. Decoding multiplies memory roughly 22x per payload byte *while
+  `BG(unserialize).level == 1`*, so one request OOMs inside `unserialize()`
+  with the stale state left exactly as above - from a stock `memory_limit=128M`
+  pool. The payload ladder walks down to whatever the front lets through
+  (`post_max_size` defaults to 8M; nginx needs `client_max_body_size 5m`,
+  stock `1m` is too small). A session-growing fallback plus a big-body probe
+  covers fronts that cap bodies lower.
 
 ### 2. Locate and reclaim (oracle lab mode)
 
@@ -131,11 +157,25 @@ a mismatch crashes the worker and the next candidate is tried. The worker
 still dies on success (HTTP 502) and the proof is the command's output file.
 
 The HTTP leak reuses the stale-session string: the builder's `bigvar.php`
-stores `k0..k3` before a 4 MB tail, a reclaimed 16 KB big field plants a forged
-`zend_string` header over the freed k1 slot, its length spans the stale zval
-array (chunk pointer) and the `execute_ex` handler table inside the chunk (PIE
-pointer), and the app reflects the bytes. The read is retried because the
-worker can abort after answering; `leak` prints the two bases.
+stores `k0..k3` before a 4 MB tail (the amplifier payload seeds its own four),
+a reclaimed field lands over the freed k1 slot, and the app reflects the
+bytes. The reclaim buffer is **tiled with the read length**: wherever the
+freed string sits inside it, the `zend_string` it aliases carries a sane
+oversized length, so the reflected `r` becomes an OOB read spanning the stale
+zval array (chunk pointer) and the `execute_ex` handler table (PIE pointer).
+Tiling is what makes the geometry shape-discoverable on a build nobody
+calibrated: a single pre-placed header only worked when the slot happened to
+land on that exact offset, and read a garbage length (crashing the worker)
+when it did not.
+
+The slot the buffer has to hit is allocator luck *per environment* (the
+build's compile-time prefix and the checkout paths shift the heap), so phase 1
+of `calibrate` sweeps reclaim shapes, retries a miss (short read or worker
+crash), and requires two reads to agree on their pointer offsets before
+accepting a geometry. **Run `calibrate` once per host** before trusting
+`no-oracle` there; the shipped profile is the reference geometry of the
+calibration machine. The read is retried because the worker can abort after
+answering; `leak` prints the two bases.
 Absolute bases change when the master restarts, so the leak is repeated per
 run. This mode removes both the runtime `/proc/<pid>/mem` dependency and the
 need to know the ASLR bases in advance.
@@ -216,6 +256,8 @@ target arguments.
 | --- | --- | --- | --- | --- |
 | 7.2.34 | :8268 | :8269 | :9168 | :9169 |
 | 7.4.33 | :8336 | :8337 | :9236 | :9237 |
+| 8.0.30 | :8594 | :8595 | :9494 | :9495 |
+| 8.1.33 | :8662 | :8663 | :9562 | :9563 |
 | 8.2.34 | :8406 | :8407 | :9306 | :9307 |
 | 8.3.35 | :8478 | :8479 | :9378 | :9379 |
 | 8.4.0 | :8480 | :8481 | :9380 | :9381 |
@@ -232,9 +274,18 @@ Pools (from `lab/fpm/php-fpm.conf.in`):
 - **builder** — `memory_limit=64M`, `cleanup=Off` (builds the ~4 MB session
   files consumed by `producer` and `build-oom`).
 
+`up --mode default` renders the single-surface shape instead: ONE pool per
+build with the php.ini production settings (`memory_limit=128M`,
+`pm=dynamic` with five workers, `post_max_size=8M`, `cleanup=On`) behind ONE
+nginx server block whose only non-stock line is `client_max_body_size 8m`.
+The classic chain server additionally exposes the builder pool behind `/b/`
+through a `b -> .` webroot symlink (no regex location, so the PCRE-free lab
+nginx accepts it) - that is the surface `--builder-prefix /b` uses.
+
 The builder webroot includes `bigvar.php` (the arm used by `leak`),
-`leakvar.php` (a tunable variant for geometry research) and `refb.php` (a
-benign short session). `app.php` can emit `X-Debug-*` diagnostics to
+`leakvar.php` (a tunable variant for geometry research), `refb.php` (a
+benign short session) and `grow.php` (the accumulating / amplifier endpoint
+of the growth arm). `app.php` can emit `X-Debug-*` diagnostics to
 `/tmp/p2s_dbg.txt`; those headers are lab-only instrumentation.
 
 Requirements: Python 3.11+, gcc for the user-prefix PHP builds
@@ -278,9 +329,20 @@ python3 tools/php2shell_fpm.py \
   --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 \
   --version 8.4.26 --command 'id>out/p1' --proof-file out/p1 \
   no-oracle
+
+# stock installation: one URL, one pool, amplifier arm, worker fan-out
+python3 tools/php2shell_fpm.py \
+  --base http://target --version 8.4.26 \
+  --command 'id>out/p1' --proof-file out/p1 \
+  no-oracle
+
+# checklist of every precondition (version, app operations, arm physics)
+python3 tools/php2shell_fpm.py --base http://target --version 8.4.26 probe
 ```
 
-(Global options come before the subcommand.)
+(Global options come before the subcommand. `--workers N` - default 5 - fans
+the arm/consume over a `pm=dynamic` pool; `--builder-prefix /b` runs both
+classic surfaces behind one port.)
 
 Via the dispatcher (`tools/php2shell_auto.py` fingerprints nginx and routes
 to the FPM chain; the lab needs an explicit `--builder` because the consumer
@@ -303,7 +365,7 @@ PHP2SHELL_FPM_LAB=1 python3 -m unittest \
 ## Session-file plant (PHP 5.4-8.x, `poison`)
 
 The other half of `session.upload_progress` works on **every** version,
-including PHP <= 7.x where the struct-freeing chain does not apply:
+including the branches without a verified reclaim (5.x and 7.2):
 
 1. `MULTIPART_EVENT_FORMDATA` copies the session id **from the POST body**
    without consulting `session.use_only_cookies`;
@@ -317,8 +379,8 @@ including PHP <= 7.x where the struct-freeing chain does not apply:
    reflects it — over HTTP, no `/proc` anywhere.
 
 ```sh
-python3 tools/php2shell_fpm.py --version 7.4.33 \
-  --base http://127.0.0.1:8336 --builder http://127.0.0.1:8337 \
+python3 tools/php2shell_fpm.py --version 7.2.34 \
+  --base http://127.0.0.1:8268 --builder http://127.0.0.1:8269 \
   poison --sid plant7x --payload 'PLANTED_MARKER'
 ```
 
@@ -326,8 +388,8 @@ This is arbitrary **session-file write** pre-auth, not RCE by itself: the
 serializer rejects keys containing `|` (so the key cannot smuggle objects) and
 the files handler validates the id, which rules out path traversal. Turning the
 plant into code execution needs an application gadget or a local file include
-in the target — which is why PHP <= 7.x is reported as *session plant* and RCE
-is reserved for 8.0+, where the struct-freeing chain applies.
+in the target — which is why 5.x and 7.2 are reported as *session plant*; from
+7.4 up the struct-freeing chain applies and `no-oracle` gives remote RCE.
 
 ## Remote calibration (`calibrate`)
 
@@ -365,12 +427,18 @@ version (patched releases are skipped by design):
 
 ```text
 7.2.34    SESSION PLANT      pre-auth write into sess_<sid>
-7.4.33    SESSION PLANT      pre-auth write into sess_<sid>
+7.4.33    REMOTE RCE         uid=1000(...) ...
+8.0.30    REMOTE RCE         uid=1000(...) ...
+8.1.33    REMOTE RCE         uid=1000(...) ...
 8.2.34    REMOTE RCE         uid=1000(...) ...
 8.3.35    REMOTE RCE         uid=1000(...) ...
 8.4.25    REMOTE RCE         uid=1000(...) ...
 8.4.26    REMOTE RCE         uid=1000(...) ...
 ```
+
+Every run records its verdict in `profiles/verification.json` (merged, so a
+later partial run does not erase earlier evidence); the README status table is
+updated from that file.
 
 ## Limitations and future work
 
@@ -380,13 +448,20 @@ version (patched releases are skipped by design):
   overrides/fallbacks. The shipped chain still targets the loopback lab.
 - **Per-build offsets.** `basic_globals` / `zif_system` / `zval_ptr_dtor` are
   PIE-relative offsets for the exact FPM build; another distro or version
-  needs its own profile (`sapi: "fpm"`, see `profiles/schema.json`).
+  needs its own profile (`sapi: "fpm"`, see `profiles/fpm-schema.json`).
+  The FPM leak geometry is additionally *per environment*: run `calibrate`
+  on the host that will run the exploit.
 - **Command length.** ≤ 87 bytes, no NUL (fake `zend_string` carrier).
 - **Worker death is expected.** The RETVAL/`efree` abort after `zif_system`
   kills the consumer worker; FPM respawns it. Long-lived targets see a brief
   502.
-- **Two endpoints.** The arm phase must hit a larger pool than the consumer;
-  a single-endpoint deployment would OOM the consumer worker.
+- **Arm shapes.** Classic mode needs two endpoints (the arm must hit a
+  larger pool than the consumer; a single-endpoint deployment would OOM the
+  consumer worker). The growth arm needs only one stock pool, but the front
+  must pass ~5 MB bodies (nginx `client_max_body_size 5m`; stock `1m` is too
+  small for `memory_limit=128M`) and the application must provide
+  `session_start()`, a stored reference, a reflected session value and an
+  arm operation (`session_decode()` of attacker data, or accumulation).
 - **8.4.27+ is clean.** `PHP_RINIT(basic)` reclaims/memsets the state before
   the window; `patchcheck` proves `level=0`.
 

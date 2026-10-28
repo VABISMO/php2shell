@@ -5,13 +5,20 @@ Generated from `profiles/*.json` by `tools/php2shell_inventory.py`.
 | PHP | Build | `zif_system` | `zval_ptr_dtor` | `htdata` | stage1_n | forge | stage2_t | RCE |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 7.4.33 | php-7.4.33-bookworm-aarch64 | 0x309640 | 0x3f6024 | - | - | - | - | no |
+| 7.4.33 | php-7.4.33-fpm | 0x34c0a0 | 0x403be0 | - | - | - | - | yes |
 | 8.0.30 | php-8.0.30-bookworm-aarch64 | 0x31ef70 | 0x40ddb0 | - | - | - | - | no |
+| 8.0.30 | php-8.0.30-fpm | 0x359b20 | 0x4145e0 | - | - | - | - | yes |
+| 8.1.33 | php-8.1.33-fpm | 0x367ca0 | 0x427120 | - | - | - | - | yes |
 | 8.1.34 | php-8.1.34-bookworm-aarch64 | 0x341e08 | 0x42e7a0 | - | - | - | - | no |
 | 8.2.34 | php-8.2.34-bookworm-aarch64 | 0x36ff48 | 0x4606c0 | - | 0 | 0 | 406 | no |
+| 8.2.34 | php-8.2.34-fpm | 0x3769d0 | 0x439120 | - | - | - | - | yes |
 | 8.3.0 | php-8.3.0-bookworm | 0x3771f0 | 0x467cf0 | - | - | - | 406 | no |
 | 8.3.33 | php-8.3.33-wordpress-mod_php | 0x377248 | 0x4737e0 | - | 815 | 63 | 406 | no |
 | 8.3.35 | php-8.3.35-bookworm-aarch64 | 0x377428 | 0x46fcc0 | - | 841 | 63 | 406 | no |
+| 8.3.35 | php-8.3.35-fpm | 0x37d5f0 | 0x446460 | - | - | - | - | yes |
+| 8.4.0 | php-8.4.0-fpm | 0x384380 | 0x542dd0 | - | - | - | - | yes |
 | 8.4.25 | php-8.4.25-bookworm-aarch64 | 0x42fa30 | 0x637ae0 | 0x690d8 | 841 | 63 | 406 | yes |
+| 8.4.25 | php-8.4.25-fpm | 0x386460 | 0x549890 | - | - | - | - | yes |
 | 8.4.26 | php-8.4.26-bookworm-amd64 | 0x465370 | 0x65eb60 | 0x690d8 | 841 | 79 | 406 | yes |
 | 8.4.26 | php-8.4.26-fpm | 0x386660 | 0x54a0d0 | - | - | - | - | yes |
 | 8.5.0 | php-8.5.0-bookworm | 0x503510 | 0x731d80 | - | 841 | 63 | 406 | no |
@@ -19,7 +26,7 @@ Generated from `profiles/*.json` by `tools/php2shell_inventory.py`.
 | 8.5.11 | php-8.5.11-bookworm-aarch64 | 0x5314f0 | 0x761b80 | 0x690d8 | 841 | 63 | 406 | yes |
 | 8.5.11 | php-8.5.11-bookworm-amd64 | 0x5996e0 | 0x7b47a0 | 0x690d8 | 841 | 63 | 406 | yes |
 
-**14 profiles, 6 with verified RCE** (5 Apache/mod_php + 1 PHP-FPM). The FPM
+**21 profiles, 13 with verified RCE** (13 Apache/mod_php + 8 PHP-FPM). The FPM
 row is an amd64 user-prefix build; its stage columns do not apply. The
 `no-oracle` path leaks the chunk and PIE bases over HTTP from the stale session
 string; the lab-only `endgame` can still read them through `/proc`.

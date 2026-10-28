@@ -147,6 +147,8 @@ class InventoryTests(unittest.TestCase):
     def test_profiles_are_valid(self):
         names = set()
         for path in sorted((ROOT / "profiles").glob("*.json")):
+            if path.name == "verification.json":
+                continue  # verdict records written by the matrix run
             if path.name in ("schema.json", "fpm-schema.json"):
                 continue
             data = json.loads(path.read_text())

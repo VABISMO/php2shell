@@ -40,7 +40,8 @@ serves a low-memory **chain** pool (8M, cleanup on) and a high-memory
 
 ```sh
 lab/fpm/build_nginx.sh
-lab/fpm/build_php.sh 8.4.26          # any of 8.2.34, 8.3.35, 8.4.0, 8.4.25, 8.4.26
+lab/fpm/build_php.sh 8.4.26          # any of 7.4.33, 8.0.30, 8.1.33, 8.2.34,
+                                      # 8.3.35, 8.4.0, 8.4.25, 8.4.26
 python3 tools/php2shell_fpm_labs.py up --only 8.4.26
 python3 tools/php2shell_fpm_labs.py status
 python3 tools/php2shell_fpm_labs.py smoke

@@ -1,7 +1,9 @@
 .PHONY: help test lint secrets ci bootstrap inventory validate-profiles validate-fpm \
-        build-nginx build-php build-all profile-draft calibrate-remote remote matrix \
+        build-nginx build-php build-all profile-draft calibrate-remote remote \
+        probe-remote remote-default matrix \
         labs-up labs-down labs-status labs-test \
-        labs-fpm-up labs-fpm-down labs-fpm-status labs-fpm-smoke labs-fpm-ports labs-fpm-test \
+        labs-fpm-up labs-fpm-up-default labs-fpm-down labs-fpm-status labs-fpm-smoke \
+        labs-fpm-ports labs-fpm-test \
         clean
 
 help:                          ## Show this help
@@ -31,7 +33,8 @@ validate-profiles:             ## Validate every build profile against the gener
 	  from pathlib import Path; \
 	  [jsonschema.validate(json.loads(p.read_text()), schema) or print(f'  ok  {p.name}') \
 	   for p in sorted(Path('profiles').glob('*.json')) \
-	   if p.name not in ('schema.json', 'fpm-schema.json')]"
+	   if p.name not in ('schema.json', 'fpm-schema.json', \
+	                      'verification.json')]"
 
 validate-fpm:                  ## Validate the PHP-FPM profiles against the FPM schema
 	python3 -c "import glob, json, jsonschema; \
@@ -75,6 +78,20 @@ remote:                        ## Run the 100%-remote chain (VERSION=... BASE=..
 	  --command "id>out/remote-$(VERSION)" --proof-file "out/remote-$(VERSION)" \
 	  no-oracle
 
+probe-remote:                  ## Checklist of every chain precondition (VERSION=... BASE=...)
+	@test -n "$(VERSION)" -a -n "$(BASE)" || \
+	  (echo "usage: make probe-remote VERSION=8.4.26 BASE=http://target"; exit 2)
+	python3 tools/php2shell_fpm.py --version "$(VERSION)" \
+	  --base "$(BASE)" probe
+
+remote-default:                ## 100%-remote chain against a stock install (VERSION=... BASE=...)
+	@test -n "$(VERSION)" -a -n "$(BASE)" || \
+	  (echo "usage: make remote-default VERSION=8.4.26 BASE=http://target"; exit 2)
+	python3 tools/php2shell_fpm.py --version "$(VERSION)" \
+	  --base "$(BASE)" \
+	  --command "id>out/remote-$(VERSION)" --proof-file "out/remote-$(VERSION)" \
+	  no-oracle
+
 matrix:                        ## Verify the remote chain on every unpatched build
 	python3 tools/php2shell_fpm_matrix.py
 
@@ -96,6 +113,9 @@ labs-test:                     ## Run the dispatcher against each Docker lab
 
 labs-fpm-up:                   ## Start the nginx + PHP-FPM laboratories (no Docker)
 	python3 tools/php2shell_fpm_labs.py up
+
+labs-fpm-up-default:           ## Start the FPM lab in the stock-installation shape
+	python3 tools/php2shell_fpm_labs.py up --mode default
 
 labs-fpm-down:                 ## Stop the nginx + PHP-FPM laboratories
 	python3 tools/php2shell_fpm_labs.py down

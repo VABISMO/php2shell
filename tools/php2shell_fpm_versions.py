@@ -10,10 +10,11 @@ Upstream patched the supported branches only:
 
     8.2.35, 8.3.36, 8.4.27
 
-Every earlier release of those branches is vulnerable.  PHP 8.1 and older
+Every earlier release of those branches is vulnerable.  (PHP 8.5 is fixed in
+8.5.12 but is deliberately out of scope for this repository.)  PHP 8.1 and
+older
 (including 7.x) are end-of-life and never receive a fix: there is no
-release of those branches that is not vulnerable.  (PHP 8.5 is fixed in
-8.5.12 but is deliberately out of scope for this repository.)
+release of those branches that is not vulnerable.
 
 This module is the single source of truth for that matrix; the lab, the
 profile generator, and the calibration harness all resolve versions through
@@ -40,6 +41,10 @@ VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 BRANCHES: dict[str, dict] = {
     "7.2": {"fixed_in": None, "last_release": "7.2.34", "slot": 0},
     "7.4": {"fixed_in": None, "last_release": "7.4.33", "slot": 1},
+    # EOL and never patched: 8.0/8.1 are chain-verified (7.4+ mechanism);
+    # 5.x has no zend_reference to forge, so the plant is its chain.
+    "8.0": {"fixed_in": None, "last_release": "8.0.30", "slot": 6},
+    "8.1": {"fixed_in": None, "last_release": "8.1.33", "slot": 7},
     "8.2": {"fixed_in": "8.2.35", "last_release": "8.2.34", "slot": 2},
     "8.3": {"fixed_in": "8.3.36", "last_release": "8.3.35", "slot": 3},
     "8.4": {"fixed_in": "8.4.27", "last_release": "8.4.26", "slot": 4},
@@ -47,7 +52,11 @@ BRANCHES: dict[str, dict] = {
 
 # Branches that are vulnerable and were never patched at all.  Listed for
 # documentation; every branch without a "fixed_in" release behaves the same.
-EOL_BRANCHES: tuple[str, ...] = ("5.x", "7.x", "8.0", "8.1")
+EOL_BRANCHES: tuple[str, ...] = ("5.x", "7.x", "8.0", "8.1")  # never patched
+
+# session.upload_progress exists from PHP 5.4 on, so 5.0-5.3 have no attack
+# surface for either chain of this advisory
+UPLOAD_PROGRESS_FROM = (5, 4)
 
 # The lab keeps the historical port assignment of the first three builds so
 # the documented URLs (README, CI) stay stable.
@@ -168,11 +177,15 @@ def has_session_cancel_decode(source: str) -> bool:
 
     ``php_session_decode`` wraps the serializer in ``zend_try/zend_catch``
     and calls ``php_session_cancel_decode()`` -> ``php_session_destroy()``,
-    which frees the ``php_unserialize_data`` struct the OOM left behind.
-    That freed slot is the one the chain reclaims.  PHP <= 7.x has no such
-    path: the bailout skips ``PHP_VAR_UNSERIALIZE_DESTROY`` and nothing
-    frees the struct, so ``BG(unserialize).data`` keeps pointing at live
-    memory and there is no use-after-free to exploit.
+    which unlinks the session file the OOM was decoding.  The struct the
+    chain reclaims is *not* freed there: ``BG(unserialize).data`` is an
+    emalloc block that the Zend memory manager releases at request end on
+    every PHP version, and the reuse logic in ``php_var_unserialize_init``
+    predates 8.2 as well - so the chain applies from PHP 7.4 on (verified
+    end to end on 7.4.33, 8.0.30 and 8.1.33).  This detector remains the
+    marker for the unlink side effect, which the
+    rebuild-every-iteration logic relies on: an 8.2+ arm destroys the
+    session file, older builds keep it.
     """
     if os.path.isdir(source):
         path = os.path.join(source, "ext", "session", "session.c")
@@ -193,12 +206,24 @@ def has_session_cancel_decode(source: str) -> bool:
 def chain_applies(version: str) -> bool:
     """Whether this repository's chain can apply to a version at all.
 
-    The version string only tells the supported branches apart (8.0+); a
-    real build is classified with :func:`has_session_cancel_decode`, which
-    reads the source instead of trusting the version.
+    The stale ``BG(unserialize)`` state after a post-RINIT OOM is left
+    behind on every branch from PHP 7.4 up: ``php_var_unserialize_init``
+    reuses ``BG(unserialize).data`` whenever ``level > 0``, the Zend
+    memory manager frees that emalloc block at request end, and
+    ``php_session_cancel_decode`` (8.2+) only unlinks the session file -
+    it never touches the struct.  Verified end to end (RCE over HTTP)
+    on 7.4.33, 8.0.30, 8.1.33, 8.2.34, 8.3.35 and the 8.4/8.5 branches.
+
+    7.2 arms the stale state too, but no reclaim shape covers the struct
+    on its allocator yet, so 7.2 and 5.x stay on the session-file plant
+    until a run proves them.
+
+    A real build can still be classified with
+    :func:`has_session_cancel_decode`, which reads the source instead of
+    trusting the version.
     """
     major, minor, _patch = parse(version)
-    return (major, minor) >= (8, 0)
+    return (major, minor) >= (7, 4)
 
 
 def build_status(binary: str) -> str:

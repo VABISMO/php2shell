@@ -38,6 +38,25 @@ jobs:
       - name: Start lab
         run: python3 tools/php2shell_fpm_labs.py up --only ${{ matrix.version }}
 
+      # the leak geometry is per environment (allocator + build paths), so
+      # the runner derives its own before the tests instead of trusting the
+      # shipped reference profile
+      - name: Calibrate the leak geometry over HTTP
+        run: |
+          python3 - <<'EOF'
+          import sys
+          sys.path.insert(0, "tools")
+          import php2shell_fpm_labs as labs
+          import php2shell_fpm as fpm
+          version = "${{ matrix.version }}"
+          chain, builder, *_ = labs.builds_map([version])[version]
+          sys.argv = ["calibrate", "--version", version,
+                      "--base", f"http://127.0.0.1:{chain}",
+                      "--builder", f"http://127.0.0.1:{builder}",
+                      "--proof-file", "out/ci-calib", "calibrate"]
+          raise SystemExit(fpm.main())
+          EOF
+
       - name: Enable ptrace for the oracle test
         run: sudo sysctl -w kernel.yama.ptrace_scope=0
 
