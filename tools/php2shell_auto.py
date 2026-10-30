@@ -176,6 +176,16 @@ def run_fpm_chain(ui, args, version: str) -> int:
     ui.info(f"command: {command}  (worker cwd = pool chdir)")
     ui.info("calibration oracle: /proc/<worker>/mem (local lab)")
 
+    if args.dry_run:
+        cmd = [sys.executable, os.path.join(HERE, "php2shell_fpm.py"),
+               "--base", base, "--builder", builder, "--version", version,
+               "--command", command, "--proof-file", proof_file]
+        if args.allow_remote:
+            cmd.append("--allow-remote")
+        cmd.append("endgame")
+        ui.command(cmd)
+        return 0
+
     ns = argparse.Namespace(
         base=base,
         builder=builder,

@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import ipaddress
 import json
 import os
 import re
@@ -122,6 +123,31 @@ def _cookie(sid: bytes) -> bytes:
 def _origin(url: str) -> str:
     u = urllib.parse.urlsplit(url)
     return f"{u.scheme}://{u.netloc}"
+
+
+def is_loopback(host: str) -> bool:
+    """True when every address for host is a loopback address."""
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False
+    return bool(infos) and all(
+        ipaddress.ip_address(info[4][0]).is_loopback for info in infos)
+
+
+def remote_targets_allowed(base: str, builder: str | None, allow_remote: bool) -> bool:
+    """Remote use is opt-in, matching the Apache dispatcher's safety gate."""
+    if allow_remote:
+        return True
+    for url in (base, builder):
+        if not url:
+            continue
+        host = urllib.parse.urlsplit(url).hostname or ""
+        if not is_loopback(host):
+            return False
+    return True
 
 
 def configure_paths(args) -> None:
@@ -2414,6 +2440,9 @@ def cmd_patchcheck(args) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     parser.add_argument("--base", default="http://127.0.0.1:8110")
+    parser.add_argument("--allow-remote", action="store_true",
+                        help="allow non-loopback --base/--builder targets "
+                             "(written authorization required)")
     parser.add_argument("--builder", default=None,
                         help="builder surface URL (default: same origin as "
                              "--base, which selects the growth arm)")
@@ -2504,6 +2533,10 @@ def main() -> int:
     args = parser.parse_args()
     if not args.builder:
         args.builder = args.base
+    if not remote_targets_allowed(args.base, args.builder, args.allow_remote):
+        print(f"[!] {args.base} / {args.builder} is not loopback; "
+              "use --allow-remote only with written authorization.", file=sys.stderr)
+        return 4
     configure_paths(args)
     # PHP < 8.2 never frees the unserialize struct on the OOM bailout (no
     # php_session_cancel_decode), so there is nothing for these commands to

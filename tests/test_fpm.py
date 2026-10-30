@@ -107,6 +107,43 @@ class NoOracleRemoteModeTests(unittest.TestCase):
             local.assert_called_once_with("8.4.26")
 
 
+class DispatcherDryRunTests(unittest.TestCase):
+    """--dry-run must not start the FPM chain."""
+
+    def test_dry_run_does_not_call_endgame(self):
+        import php2shell_auto as auto
+
+        args = SimpleNamespace(
+            target="http://127.0.0.1:8110/index.php", builder=None,
+            command="id>/out/p1", proof_file=None, dry_run=True,
+            allow_remote=False)
+        ui = SimpleNamespace(
+            stage=lambda *a, **k: None, info=lambda *a, **k: None,
+            command=lambda *a, **k: None, crit=lambda *a, **k: None,
+            result=lambda *a, **k: None)
+        with mock.patch.object(fpm, "cmd_endgame") as endgame:
+            self.assertEqual(auto.run_fpm_chain(ui, args, "8.4.26"), 0)
+            endgame.assert_not_called()
+
+
+class RemoteAuthorizationTests(unittest.TestCase):
+    """Remote targets are opt-in, matching the Apache dispatcher."""
+
+    def test_loopback_is_allowed(self):
+        self.assertTrue(fpm.remote_targets_allowed(
+            "http://127.0.0.1:8110", "http://localhost:8111", False))
+
+    def test_remote_is_refused_by_default(self):
+        self.assertFalse(fpm.remote_targets_allowed(
+            "http://192.0.2.10", None, False))
+        self.assertFalse(fpm.remote_targets_allowed(
+            "http://127.0.0.1:8110", "http://192.0.2.11", False))
+
+    def test_explicit_opt_in_is_honoured(self):
+        self.assertTrue(fpm.remote_targets_allowed(
+            "http://192.0.2.10", None, True))
+
+
 class EndgamePayloadTests(unittest.TestCase):
     """The forged buffer must encode the exact dtor-chain layout the
     8.4.26 source expects (var_unserializer.re, session.c, zend_hash.c)."""

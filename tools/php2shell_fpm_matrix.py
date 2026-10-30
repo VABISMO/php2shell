@@ -137,7 +137,9 @@ def main() -> int:
                         help="versions to verify (default: the unpatched matrix)")
     args = parser.parse_args()
     os.makedirs(OUTDIR, exist_ok=True)
-    verification_path = os.path.join(ROOT, "profiles", "verification.json")
+    verification_path = os.path.join(ROOT, "docs", "calibration-logs",
+                                    "verification.json")
+    os.makedirs(os.path.dirname(verification_path), exist_ok=True)
 
     results = []
     for version in args.versions:

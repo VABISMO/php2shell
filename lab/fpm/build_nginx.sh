@@ -10,7 +10,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RUNTIME="$HERE/runtime"
 SRC="$RUNTIME/src"
 PREFIX="$RUNTIME/nginx"
-JOBS="${JOBS:-$(nproc)}"
+JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)}"
 
 mkdir -p "$SRC"
 
