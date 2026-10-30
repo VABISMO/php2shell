@@ -378,6 +378,43 @@
           "type": "integer",
           "minimum": 1,
           "description": "Name length of the stage-3 second-request fields (3-char names shift the reclaim phase versus 31-char names)."
+        },
+        "stage3_mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "carrier",
+            "lab",
+            "vessel",
+            null
+          ],
+          "description": "Stage-3 variant: 'carrier' (upstream 15-byte bin-40 string), 'lab' (55-byte reference carriers) or 'vessel' (reference pattern embedded in a fake-HashTable blob; see tools/php2shell_vessel.py). Null when stage 3 is not calibrated."
+        },
+        "stage3_early": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "Vessel mode: bytes of the S-side early field that steers the dangling reference one page up (bin-13 sized, e.g. 160)."
+        },
+        "stage3_blobs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "Vessel mode: number of B2 fake-HashTable blobs (bin-13 allocations)."
+        },
+        "stage3_vessel_index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Vessel mode: index of the B2 blob that carries the embedded reference pattern."
         }
       },
       "additionalProperties": false
@@ -525,6 +562,7 @@
               "stage1_forge_len",
               "stage2_t",
               "stage2_v",
+              "stage3_mode",
               "stage3_pads",
               "stage3_carrier"
             ],
@@ -534,6 +572,19 @@
               },
               "stage3_carrier": {
                 "type": "boolean"
+              },
+              "stage3_mode": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  "carrier",
+                  "lab",
+                  "vessel",
+                  null
+                ],
+                "description": "Stage-3 variant: 'carrier' (upstream 15-byte bin-40 string), 'lab' (55-byte reference carriers) or 'vessel' (reference pattern embedded in a fake-HashTable blob; see tools/php2shell_vessel.py). Null when stage 3 is not calibrated."
               }
             }
           }

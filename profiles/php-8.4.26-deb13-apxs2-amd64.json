@@ -68,7 +68,8 @@
     "stage3_wfields": 5,
     "stage3_fake_len": 31,
     "stage3_fakes": 12,
-    "stage3_b_name_len": 3
+    "stage3_b_name_len": 3,
+    "stage3_mode": "lab"
   },
   "config": {
     "memory_limit": 8388608,
