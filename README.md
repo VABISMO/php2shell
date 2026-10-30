@@ -36,6 +36,7 @@ not match the profile.
 | PHP 8.5.11 amd64 | `php:8.5.11-apache` | `php-8.5.11-bookworm-amd64` | yes | yes | **yes** | separate offsets, same `htdata` |
 | PHP 8.5.10 aarch64 | `php:8.5.10-apache` | `php-8.5.10-bookworm-aarch64` | yes | yes | **yes** | `uid=33(www-data)` |
 | PHP 8.4.26 amd64 | `php:8.4.26-apache` | `php-8.4.26-bookworm-amd64` | yes | yes | **yes** | reference build |
+| PHP 8.4.26 deb13/apxs2 amd64 | source build (Debian 13, Apache 2.4.69 apxs2) | `php-8.4.26-deb13-apxs2-amd64` | yes | yes | **yes** | third stage-3 layout; instance-dependent; requires `--profile deb13-apxs2` |
 | PHP 8.4.26 FPM amd64 | php-8.4.26 source tarball (nginx+FPM) | `php-8.4.26-fpm` | http (stale string) | http (stale string) | **yes** | `BG(unserialize)` chain; two-slot reclaim; HTTP-only `no-oracle` endgame |
 | PHP 8.4.25 FPM amd64 | php-8.4.25 source tarball (nginx+FPM) | `php-8.4.25-fpm` | http (stale string) | http (stale string) | **yes** | same chain, calibrated geometry |
 | PHP 8.4.0 FPM amd64 | php-8.4.0 source tarball (nginx+FPM) | `php-8.4.0-fpm` | http (stale string) | http (stale string) | **yes** | earliest 8.4 release of the branch |
@@ -56,8 +57,8 @@ not match the profile.
 | PHP 7.4.33 aarch64 | `php:7.4-apache` | `php-7.4.33-bookworm-aarch64` | no | no | no | UAF; leak shape differs |
 | PHP 8.2.0 aarch64 | `php:8.2.0-apache` | — (offsets only) | n/a | n/a | no | no heap profile |
 
-**21 profiles (13 Apache/mod_php + 8 PHP-FPM), 13 with verified RCE. Offsets
-extracted for 12 Apache builds.** The PHP-FPM profiles are
+**22 profiles (14 Apache/mod_php + 8 PHP-FPM), 14 with verified RCE. Offsets
+extracted for 12 official-image Apache builds.** The PHP-FPM profiles are
 **contributor-reported, not independently confirmed** and environment-specific (the compile-time prefix
 shifts the heap); re-run `calibrate` on the host that will run the exploit
 instead of trusting the shipped geometry. They have no Apache leak stages: the
@@ -78,7 +79,12 @@ offsets-only entry. All `yes` Apache rows use the lab configuration: prefork
 `session.upload_progress=On`; the FPM row uses the nginx+FPM lab. Per-image
 offsets and `libphp` sha256 are in
 [the offset inventory](docs/offset-inventory.md). The 8.4.25 profile needs the
-default retries because its stage 3 is probabilistic.
+default retries because its stage 3 is probabilistic. The 8.4.26 deb13/apxs2
+row is a **contributor-reported, not independently confirmed source build**,
+not an official image: its stage-3 phase is instance-dependent (the contributor reported 4/4 runs on one Apache master and
+0/5+ on others), so treat `rce: true` as “reproduced on the reporter's lab” and
+retry on a fresh worker/master. Because two 8.4.26 amd64 profiles exist, the
+dispatcher requires `--profile deb13-apxs2` for this build.
 
 ## Features
 

