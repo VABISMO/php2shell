@@ -58,7 +58,7 @@ not match the profile.
 
 **21 profiles (13 Apache/mod_php + 8 PHP-FPM), 13 with verified RCE. Offsets
 extracted for 12 Apache builds.** The PHP-FPM profiles are
-**contributor-reported** and environment-specific (the compile-time prefix
+**contributor-reported, not independently confirmed** and environment-specific (the compile-time prefix
 shifts the heap); re-run `calibrate` on the host that will run the exploit
 instead of trusting the shipped geometry. They have no Apache leak stages: the
 chain abuses the stale `BG(unserialize)` struct instead.
