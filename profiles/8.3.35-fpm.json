@@ -61,7 +61,7 @@
     "session_upload_progress": "On",
     "workers": 2
   },
-  "status": "RCE verified over HTTP only (no /proc access): the stale-string leak recovered chunk=0x7f1c11400000 and the PIE base 0x564b85200000 (leak+0x157e8 -> 0x4b24f6); the primitive at 0x80000/0xfe8 was observable through app.php and the forged HashTable destructor executed zif_system (proof: out/out/calib).",
+  "status": "contributor-reported — RCE verified over HTTP only (no /proc access): the stale-string leak recovered chunk=0x7f1c11400000 and the PIE base 0x564b85200000 (leak+0x157e8 -> 0x4b24f6); the primitive at 0x80000/0xfe8 was observable through app.php and the forged HashTable destructor executed zif_system (proof: out/out/calib).",
   "oom_mb": 4,
   "layout": {
     "unserialize_data": {

@@ -57,8 +57,11 @@ not match the profile.
 | PHP 8.2.0 aarch64 | `php:8.2.0-apache` | — (offsets only) | n/a | n/a | no | no heap profile |
 
 **21 profiles (13 Apache/mod_php + 8 PHP-FPM), 13 with verified RCE. Offsets
-extracted for 12 Apache builds.** The PHP-FPM profiles have no Apache leak
-stages: the chain abuses the stale `BG(unserialize)` struct instead.
+extracted for 12 Apache builds.** The PHP-FPM profiles are
+**contributor-reported** and environment-specific (the compile-time prefix
+shifts the heap); re-run `calibrate` on the host that will run the exploit
+instead of trusting the shipped geometry. They have no Apache leak stages: the
+chain abuses the stale `BG(unserialize)` struct instead.
 `no-oracle` is fully remote — it leaks the chunk and php-fpm PIE bases over
 HTTP from a stale-session string OOB read (or takes them from `--chunk`/
 `--pie`) and fires without touching `/proc/<pid>/mem`; the lab-only `endgame`
